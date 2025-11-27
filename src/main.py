@@ -40,10 +40,8 @@ def start_web_server():
     try:
         from web_server import run_server
         run_server(host='0.0.0.0', port=WEB_PORT)
-    except ImportError:
-        print("[WARNING] Không tìm thấy web_server.py, bỏ qua web dashboard")
-    except Exception as e:
-        print(f"[WARNING] Không thể khởi động web server: {e}")
+    except Exception:
+        pass  # Lỗi web server không ảnh hưởng chấm công chính
 
 def main():
     # 0. Khởi tạo Database
@@ -58,7 +56,6 @@ def main():
     cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-    # Giảm buffer size để tiết kiệm RAM
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     try:
@@ -71,37 +68,34 @@ def main():
         recognizer = FaceRecognizer()
         
         # Đồng bộ SQLite employees với face_db.pkl
-        sync_employees_with_face_db(recognizer.get_registered_names())
+        sync_result = sync_employees_with_face_db(recognizer.get_registered_names())
         
         # Garbage collect sau khi load xong models
         gc.collect()
         
     except Exception as e:
-        print(f"Lỗi khởi tạo Model: {e}")
+        print(f"❌ Lỗi khởi tạo: {e}")
         return
 
-    # Dictionary lưu thời gian chấm công gần nhất: { 'Ten_NV': time_float }
+    # Dictionary lưu thời gian chấm công gần nhất
     last_checkin = {} 
-    
-    # Dictionary theo dõi thời gian giữ mặt: { 'Ten_NV': first_seen_time }
     face_hold_tracker = {}
 
-    print("Hệ thống chấm công sẵn sàng!")
-    print(f"📍 Platform: {'Windows (GUI Mode)' if IS_WINDOWS else 'Raspberry Pi (Headless Mode)'}")
-    print(f"⏱️  Giữ mặt trong camera {HOLD_TIME_SECONDS}s để chấm công.")
-    if LOW_MEMORY_MODE:
-        print(f"💾 Chế độ tiết kiệm RAM: {CAMERA_WIDTH}x{CAMERA_HEIGHT}, skip {FRAME_SKIP} frame(s)")
+    # --- LOG KHỞI ĐỘNG GỌN GÀNG ---
+    print("\n" + "="*50)
+    print("🕐 HỆ THỐNG CHẤM CÔNG")
+    print("="*50)
     
-    if not HEADLESS_MODE:
-        print("\n🖥️  CHẾ ĐỘ DEBUG (Windows):")
-        print("   Nhấn 'r' để đăng ký khuôn mặt mới.")
-        print("   Nhấn 'd' để xóa người khỏi database.")
-        print("   Nhấn 'l' để xem danh sách đã đăng ký.")
-        print("   Nhấn 'q' để thoát.")
-    else:
-        print("\n🤖 CHẾ ĐỘ HEADLESS (Pi):")
-        print("   Quản lý thành viên qua Web Dashboard")
-        print("   Nhấn Ctrl+C để thoát.")
+    mode = "Windows (GUI)" if IS_WINDOWS else "Pi (Headless)"
+    n_people, n_emb = recognizer.get_db_info()
+    print(f"📍 Mode: {mode}")
+    print(f"👥 Database: {n_people} người ({n_emb} ảnh)")
+    
+    if sync_result['added'] or sync_result['removed']:
+        print(f"🔄 Sync: +{sync_result['added']} -{sync_result['removed']}")
+    
+    if LOW_MEMORY_MODE:
+        print(f"💾 Low-RAM: {CAMERA_WIDTH}x{CAMERA_HEIGHT}, skip={FRAME_SKIP}")
     
     if ENABLE_WEB_SERVER:
         import socket
@@ -112,9 +106,14 @@ def main():
             s.close()
         except:
             local_ip = "localhost"
-        print(f"\n🌐 Web Dashboard:")
-        print(f"   📱 Từ điện thoại: http://{local_ip}:{WEB_PORT}")
-        print(f"   💻 Local: http://localhost:{WEB_PORT}\n")
+        print(f"🌐 Web: http://{local_ip}:{WEB_PORT}")
+    
+    print("-"*50)
+    if not HEADLESS_MODE:
+        print("⌨️  r=đăng ký | d=xóa | l=list | q=thoát")
+    else:
+        print("⌨️  Ctrl+C để thoát")
+    print("="*50 + "\n")
 
     frame_count = 0
     last_status_time = 0
@@ -222,9 +221,9 @@ def main():
                                 # Reset tracker sau khi chấm công
                                 face_hold_tracker[label] = current_time + COOLDOWN_SECONDS
                                 
-                                # Log ra console (cho cả headless mode)
-                                action_text = "CHECK-IN" if action == 'check_in' else "CHECK-OUT"
-                                print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] ✅ {action_text}: {label}")
+                                # Log ngắn gọn
+                                symbol = "🟢" if action == 'check_in' else "🔴"
+                                print(f"{symbol} {label} - {action.upper().replace('_', '-')}")
                                 
                                 if not HEADLESS_MODE:
                                     if action == 'check_in':
@@ -243,10 +242,10 @@ def main():
 
             # --- PHẦN HIỂN THỊ VÀ ĐIỀU KHIỂN ---
             if HEADLESS_MODE:
-                # HEADLESS MODE (Pi): Không hiển thị GUI, chỉ log ra console định kỳ
+                # HEADLESS MODE (Pi): Log định kỳ mỗi 5 phút
                 current_time = time.time()
-                if current_time - last_status_time > 60:  # Log mỗi 60 giây
-                    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] Đang chạy... Frame: {frame_count}")
+                if current_time - last_status_time > 300:  # 5 phút
+                    print(f"[{datetime.datetime.now().strftime('%H:%M')}] ♻️ Running...")
                     last_status_time = current_time
             else:
                 # GUI MODE (Windows): Hiển thị cửa sổ camera và xử lý phím
@@ -257,71 +256,60 @@ def main():
                     break
                 elif key == ord('l'):
                     # Hiển thị danh sách đã đăng ký
-                    print("\n" + "="*40)
-                    print("📋 DANH SÁCH ĐÃ ĐĂNG KÝ:")
-                    print("="*40)
+                    print("\n📋 Database:")
                     names = recognizer.get_registered_names()
                     if names:
                         for i, name in enumerate(names, 1):
                             emb_count = len(recognizer.db[name]) if isinstance(recognizer.db[name], list) else 1
-                            print(f"  {i}. {name} ({emb_count} ảnh)")
+                            print(f"   {i}. {name} ({emb_count})")
                     else:
-                        print("  (Chưa có ai đăng ký)")
-                    print("="*40 + "\n")
+                        print("   (trống)")
+                    print()
                 elif key == ord('d'):
                     # Xóa người khỏi database
                     cv2.destroyAllWindows()
-                    print("\n" + "="*40)
-                    print("🗑️  XÓA NGƯỜI KHỎI DATABASE")
-                    print("="*40)
+                    print("\n🗑️ Xóa người:")
                     names = recognizer.get_registered_names()
                     if not names:
-                        print("Database trống, không có gì để xóa!")
+                        print("   Database trống!")
                     else:
-                        print("Danh sách hiện có:")
                         for i, name in enumerate(names, 1):
-                            emb_count = len(recognizer.db[name]) if isinstance(recognizer.db[name], list) else 1
-                            print(f"  {i}. {name} ({emb_count} ảnh)")
-                        print("-"*40)
-                        choice = input("Nhập tên cần xóa (hoặc Enter để hủy): ").strip()
+                            print(f"   {i}. {name}")
+                        choice = input("Nhập tên (Enter=hủy): ").strip()
                         if choice:
                             if recognizer.remove_face(choice):
                                 recognizer.save_db()
-                                remove_employee(choice)  # Xóa khỏi SQLite database
-                                print(f"✅ Đã xóa '{choice}' khỏi database!")
+                                remove_employee(choice)
+                                print(f"   ✅ Đã xóa: {choice}")
                             else:
-                                print(f"❌ Không tìm thấy '{choice}' trong database!")
-                        else:
-                            print("Đã hủy.")
-                    print("="*40 + "\n")
+                                print(f"   ❌ Không tìm thấy: {choice}")
+                    print()
                     cv2.namedWindow("May Cham Cong")
                 elif key == ord('r'):
-                    # Logic đăng ký đơn giản (lấy khuôn mặt to nhất trong khung hình)
+                    # Đăng ký khuôn mặt mới
                     if len(detections) > 0:
-                        # Sắp xếp lấy box to nhất (diện tích w*h)
                         detections.sort(key=lambda d: d['box'][2] * d['box'][3], reverse=True)
-                        
                         det = detections[0]
                         x, y, w, h = det['box']
                         face_reg = frame[y:y+h, x:x+w]
                         
                         cv2.destroyAllWindows()
-                        name = input("Nhap ten nhan vien moi: ")
+                        name = input("Tên nhân viên: ").strip()
                         if name:
                             recognizer.add_face(name, face_reg)
                             recognizer.save_db()
                             add_employee(name)
-                            print(f"Da dang ky thanh cong: {name}")
+                            print(f"   ✅ Đã đăng ký: {name}\n")
                         
                         cv2.namedWindow("May Cham Cong")
                     
     except KeyboardInterrupt:
-        print("\n\n🛑 Đã dừng bởi người dùng (Ctrl+C)")
+        print("\n🛑 Đã dừng (Ctrl+C)")
     finally:
         cap.release()
         if not HEADLESS_MODE:
             cv2.destroyAllWindows()
-        print("👋 Tạm biệt!")
+        print("👋 Bye!")
 
 if __name__ == "__main__":
     main()

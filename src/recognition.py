@@ -17,9 +17,6 @@ class FaceRecognizer:
         self.batch_size = input_shape[0]
         self.input_height = input_shape[1]
         self.input_width = input_shape[2]
-            
-        print(f"[Recognition] Model input size: {self.input_width}x{self.input_height}")
-        print(f"[Recognition] Input shape: {input_shape} (batch={self.batch_size})")
         
         self.db_path = db_path
 
@@ -28,7 +25,6 @@ class FaceRecognizer:
                 self.db = pickle.load(f)
 
             self._migrate_db_format()
-            self._print_db_info()
         else:
             self.db = {}
     
@@ -41,15 +37,11 @@ class FaceRecognizer:
                 migrated = True
         if migrated:
             self.save_db()
-            print("[Recognition] Đã migrate database sang format mới (multi-embedding)")
     
-    def _print_db_info(self):
-        """In thông tin database"""
+    def get_db_info(self):
+        """Trả về thông tin database để hiển thị"""
         total_embeddings = sum(len(embs) if isinstance(embs, list) else 1 for embs in self.db.values())
-        print(f"[Recognition] Loaded {len(self.db)} người với tổng {total_embeddings} embeddings")
-        for label, embs in self.db.items():
-            count = len(embs) if isinstance(embs, list) else 1
-            print(f"   - {label}: {count} ảnh")
+        return len(self.db), total_embeddings
 
     def get_embedding(self, face_img):
         img = cv2.resize(face_img, (self.input_width, self.input_height))
@@ -102,16 +94,13 @@ class FaceRecognizer:
             if not isinstance(self.db[label], list):
                 self.db[label] = [self.db[label]]
             self.db[label].append(emb)
-            print(f"[Recognition] Thêm ảnh cho {label}, tổng: {len(self.db[label])} ảnh")
         else:
             self.db[label] = [emb]
-            print(f"[Recognition] Đăng ký mới: {label}")
 
     def remove_face(self, label):
         """Xóa người khỏi database"""
         if label in self.db:
             del self.db[label]
-            print(f"[Recognition] Đã xóa: {label}")
             return True
         return False
 

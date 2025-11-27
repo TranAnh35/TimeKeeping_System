@@ -17,8 +17,7 @@ class UltraLightFaceDetector:
             self.output_details = self.interpreter.get_output_details()
             self.input_shape = (320, 240)
         except Exception as e:
-            print(f"[ERROR] Không thể load model Detection tại: {model_path}")
-            print(f"Chi tiết lỗi: {e}")
+            print(f"[LỖI] Detection model: {e}")
             self.interpreter = None
 
     def detect_faces(self, frame):

@@ -15,9 +15,6 @@ class AntiSpoof:
             self.height = self.input_shape[1]
             self.width = self.input_shape[2]
             
-            print(f"[AntiSpoof] Đã load model: {model_path}")
-            print(f"[AntiSpoof] Input shape yêu cầu: {self.width}x{self.height}")
-            
         except Exception as e:
             print(f"[ERROR] Không tìm thấy model AntiSpoof tại: {model_path}")
             print("Hãy kiểm tra lại đường dẫn file .tflite")

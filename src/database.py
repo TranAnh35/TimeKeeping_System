@@ -56,7 +56,6 @@ def init_db():
     
     conn.commit()
     conn.close()
-    print(f"[Database] Khởi tạo thành công: {DB_PATH}")
 
 def get_current_status(name):
     """
@@ -112,7 +111,6 @@ def check_in(name):
     
     conn.commit()
     conn.close()
-    print(f"[Database] CHECK-IN: {name} lúc {now.strftime('%H:%M:%S')}")
     return 'check_in'
 
 def check_out(name):
@@ -146,7 +144,6 @@ def check_out(name):
     
     conn.commit()
     conn.close()
-    print(f"[Database] CHECK-OUT: {name} lúc {now.strftime('%H:%M:%S')}")
     return 'check_out'
 
 def _do_checkout(cursor, session_id, checkout_time):
@@ -197,8 +194,6 @@ def remove_employee(name):
         cursor.execute('DELETE FROM employees WHERE name = ?', (name,))
         conn.commit()
         deleted = cursor.rowcount > 0
-        if deleted:
-            print(f"[Database] Đã xóa employee: {name}")
         return deleted
     finally:
         conn.close()
@@ -231,13 +226,11 @@ def sync_employees_with_face_db(valid_names):
     to_remove = current_employees - valid_names_set
     for name in to_remove:
         cursor.execute('DELETE FROM employees WHERE name = ?', (name,))
-        print(f"[Database] Sync - Xóa: {name}")
     
     # Thêm những tên mới
     to_add = valid_names_set - current_employees
     for name in to_add:
         cursor.execute('INSERT OR IGNORE INTO employees (name) VALUES (?)', (name,))
-        print(f"[Database] Sync - Thêm: {name}")
     
     # Reset sqlite_sequence cho employees
     cursor.execute('SELECT COUNT(*) FROM employees')
@@ -247,8 +240,8 @@ def sync_employees_with_face_db(valid_names):
     conn.commit()
     conn.close()
     
-    if to_remove or to_add:
-        print(f"[Database] Đã đồng bộ: {len(valid_names_set)} nhân viên")
+    # Return số lượng thay đổi để main.py quyết định log
+    return {'synced': len(valid_names_set), 'added': len(to_add), 'removed': len(to_remove)}
 
 def get_today_attendance():
     """Lấy danh sách chấm công hôm nay"""
@@ -455,7 +448,4 @@ def export_to_csv(output_path="export_attendance.csv", start_date=None, end_date
                 'Có' if row['is_overnight'] else 'Không'
             ])
     
-    print(f"[Database] Đã export: {full_path}")
     return full_path
-
-init_db()

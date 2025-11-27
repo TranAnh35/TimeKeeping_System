@@ -294,14 +294,12 @@ def get_local_ip():
         return "localhost"
 
 def run_server(host='0.0.0.0', port=5000):
-    """Chạy web server"""
-    local_ip = get_local_ip()
-    print(f"\n{'='*50}")
-    print(f"🌐 Web Dashboard đang chạy!")
-    print(f"📱 Truy cập từ điện thoại/máy khác:")
-    print(f"   http://{local_ip}:{port}")
-    print(f"💻 Truy cập local: http://localhost:{port}")
-    print(f"{'='*50}\n")
+    """Chạy web server (log IP từ main.py)"""
+    # Suppress Flask startup logs
+    import logging
+    log = logging.getLogger('werkzeug')
+    log.setLevel(logging.ERROR)
+    
     app.run(host=host, port=port, debug=False, threaded=True)
 
 if __name__ == "__main__":
