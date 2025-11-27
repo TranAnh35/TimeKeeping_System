@@ -1,0 +1,9 @@
+[submodule "Android-MobileFaceNet-MTCNN-FaceAntiSpoofing"]
+	path = Android-MobileFaceNet-MTCNN-FaceAntiSpoofing
+	url = https://github.com/syaringan357/Android-MobileFaceNet-MTCNN-FaceAntiSpoofing.git
+[submodule "Silent-Face-Anti-Spoofing-TFLite"]
+	path = Silent-Face-Anti-Spoofing-TFLite
+	url = https://github.com/feni-katharotiya/Silent-Face-Anti-Spoofing-TFLite.git
+[submodule "Ultra-Light-Fast-Generic-Face-Detector-1MB"]
+	path = Ultra-Light-Fast-Generic-Face-Detector-1MB
+	url = https://github.com/Linzaer/Ultra-Light-Fast-Generic-Face-Detector-1MB.git

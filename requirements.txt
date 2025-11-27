@@ -1,0 +1,7 @@
+numpy
+opencv-python
+Pillow
+tensorflow       # để chạy TFLite interpreter
+face-detection-tflite
+mtcnn-tflite
+flask            # web dashboard để xem chấm công từ xa
