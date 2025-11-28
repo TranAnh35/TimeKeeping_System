@@ -1,9 +1,15 @@
 # recognition.py
-from tflite_helper import get_interpreter
 import cv2
 import numpy as np
 import os
+import sys
 import pickle
+
+# Support both direct script execution and module import
+try:
+    from .tflite_helper import get_interpreter
+except ImportError:
+    from tflite_helper import get_interpreter
 
 class FaceRecognizer:
     def __init__(self, model_path="models/recognition/MobileFaceNet.tflite", db_path="face_db.pkl"):
@@ -43,11 +49,34 @@ class FaceRecognizer:
         total_embeddings = sum(len(embs) if isinstance(embs, list) else 1 for embs in self.db.values())
         return len(self.db), total_embeddings
 
-    def get_embedding(self, face_img):
+    def _preprocess_face(self, face_img):
+        """
+        Preprocess face với các bước cải thiện chất lượng:
+        1. Resize về kích thước model
+        2. Histogram equalization để cân bằng ánh sáng
+        3. Normalize theo chuẩn MobileFaceNet [-1, 1]
+        """
+        # Resize
         img = cv2.resize(face_img, (self.input_width, self.input_height))
+        
+        # Convert to RGB
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        # Dùng float32 để tiết kiệm RAM (không dùng float64)
-        img = img.astype(np.float32) / 255.0
+        
+        # Histogram equalization trên mỗi channel để cải thiện contrast
+        # (đặc biệt hữu ích khi đeo kính hoặc ánh sáng không đều)
+        img_yuv = cv2.cvtColor(img, cv2.COLOR_RGB2YUV)
+        img_yuv[:,:,0] = cv2.equalizeHist(img_yuv[:,:,0])
+        img = cv2.cvtColor(img_yuv, cv2.COLOR_YUV2RGB)
+        
+        # Normalize to [-1, 1] (chuẩn MobileFaceNet)
+        img = img.astype(np.float32)
+        img = (img - 127.5) / 127.5
+        
+        return img
+
+    def get_embedding(self, face_img):
+        """Trích xuất embedding từ ảnh khuôn mặt"""
+        img = self._preprocess_face(face_img)
         
         input_data = np.stack([img, img], axis=0)  # Shape: [2, 112, 112, 3]
         
@@ -55,9 +84,10 @@ class FaceRecognizer:
         self.interpreter.invoke()
         
         output = self.interpreter.get_tensor(self.output_details[0]['index'])
-        emb = output[0].astype(np.float32)  # Đảm bảo float32
+        emb = output[0].astype(np.float32)
         
-        emb = emb / np.linalg.norm(emb)
+        # L2 normalize
+        emb = emb / (np.linalg.norm(emb) + 1e-10)
         
         # Giải phóng bộ nhớ tạm
         del img, input_data, output
@@ -65,26 +95,87 @@ class FaceRecognizer:
         return emb
 
     def recognize(self, face_img, threshold=0.6):
-        """Nhận diện khuôn mặt, trả về (label, distance) hoặc (None, distance)"""
+        """
+        Nhận diện khuôn mặt với chiến lược voting:
+        - Tính distance với TẤT CẢ embeddings của mỗi người
+        - Dùng AVERAGE của top-3 matches thay vì chỉ min
+        - Giúp ổn định hơn khi có nhiều biến thể (kính, góc, ánh sáng)
+        """
         if len(self.db) == 0:
             return None, float('inf')
             
         emb = self.get_embedding(face_img)
-        best_label, best_dist = None, float('inf')
+        
+        # Tính average distance cho mỗi người
+        person_scores = {}
         
         for label, embeddings in self.db.items():
             if not isinstance(embeddings, list):
                 embeddings = [embeddings]
             
-            for db_emb in embeddings:
-                dist = np.linalg.norm(db_emb - emb)
-                if dist < best_dist:
-                    best_dist = dist
-                    best_label = label
+            # Tính tất cả distances
+            distances = [np.linalg.norm(db_emb - emb) for db_emb in embeddings]
+            
+            # Lấy average của top-3 (hoặc ít hơn nếu không đủ)
+            distances.sort()
+            top_k = min(3, len(distances))
+            avg_dist = sum(distances[:top_k]) / top_k
+            
+            # Bonus: Nếu có ít nhất 1 match rất gần (<0.3), giảm distance
+            min_dist = distances[0]
+            if min_dist < 0.3:
+                avg_dist = avg_dist * 0.8  # Boost 20%
+            
+            person_scores[label] = {
+                'avg_dist': avg_dist,
+                'min_dist': min_dist,
+                'matches': len([d for d in distances if d < threshold])
+            }
         
-        if best_dist < threshold:
-            return best_label, best_dist
-        return None, best_dist
+        # Tìm người có avg_dist nhỏ nhất
+        best_label = min(person_scores, key=lambda x: person_scores[x]['avg_dist'])
+        best_info = person_scores[best_label]
+        
+        # Quyết định dựa trên avg_dist
+        if best_info['avg_dist'] < threshold:
+            return best_label, best_info['min_dist']
+        
+        return None, best_info['min_dist']
+
+    def recognize_with_confidence(self, face_img, threshold=0.6):
+        """
+        Phiên bản nâng cao: trả về confidence score và thông tin chi tiết
+        """
+        if len(self.db) == 0:
+            return None, 0.0, {}
+            
+        emb = self.get_embedding(face_img)
+        
+        results = []
+        for label, embeddings in self.db.items():
+            if not isinstance(embeddings, list):
+                embeddings = [embeddings]
+            
+            distances = sorted([np.linalg.norm(db_emb - emb) for db_emb in embeddings])
+            top_k = min(3, len(distances))
+            avg_dist = sum(distances[:top_k]) / top_k
+            
+            # Convert distance to confidence (0-100%)
+            # distance 0 -> 100%, distance >= threshold -> 0%
+            confidence = max(0, (threshold - avg_dist) / threshold) * 100
+            
+            results.append({
+                'label': label,
+                'confidence': confidence,
+                'avg_dist': avg_dist,
+                'min_dist': distances[0]
+            })
+        
+        results.sort(key=lambda x: x['confidence'], reverse=True)
+        
+        if results[0]['confidence'] > 0:
+            return results[0]['label'], results[0]['confidence'], results
+        return None, 0.0, results
 
     def add_face(self, label, face_img):
         """Thêm embedding mới cho người (không ghi đè, thêm vào list)"""

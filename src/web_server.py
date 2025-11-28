@@ -3,18 +3,32 @@
 Web server đơn giản để xem chấm công từ xa qua WiFi.
 Truy cập: http://<IP_Pi>:5000
 """
-from flask import Flask, render_template_string, jsonify, request, send_file
-from database import (
-    get_today_attendance, 
-    get_attendance_by_date,
-    get_summary_by_person,
-    get_all_employees,
-    get_today_sessions,
-    get_active_members,
-    export_to_csv
-)
-from datetime import datetime
 import os
+import sys
+from flask import Flask, render_template_string, jsonify, request, send_file
+from datetime import datetime
+
+# Support both direct script execution and module import
+try:
+    from .database import (
+        get_today_attendance, 
+        get_attendance_by_date,
+        get_summary_by_person,
+        get_all_employees,
+        get_today_sessions,
+        get_active_members,
+        export_to_csv
+    )
+except ImportError:
+    from database import (
+        get_today_attendance, 
+        get_attendance_by_date,
+        get_summary_by_person,
+        get_all_employees,
+        get_today_sessions,
+        get_active_members,
+        export_to_csv
+    )
 
 app = Flask(__name__)
 

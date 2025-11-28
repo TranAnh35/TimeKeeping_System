@@ -1,7 +1,14 @@
 # src/antispoof.py
-from tflite_helper import get_interpreter
 import cv2
 import numpy as np
+import os
+import sys
+
+# Support both direct script execution and module import
+try:
+    from .tflite_helper import get_interpreter
+except ImportError:
+    from tflite_helper import get_interpreter
 
 class AntiSpoof:
     def __init__(self, model_path="models/anti_spoof/2.7_80x80_MiniFASNetV2.tflite"):

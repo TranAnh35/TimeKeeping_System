@@ -1,8 +1,15 @@
 # src/detect.py
 import cv2
 import numpy as np
-from tflite_helper import get_interpreter
+import os
+import sys
 from math import ceil
+
+# Support both direct script execution and module import
+try:
+    from .tflite_helper import get_interpreter
+except ImportError:
+    from tflite_helper import get_interpreter
 
 # --- CẤU HÌNH ---
 MODEL_PATH = "models/detection/version-RFB-320_without_postprocessing.tflite"

@@ -7,9 +7,16 @@ import gc
 import sys
 import platform
 import threading
-from detect import detect_faces
-from recognition import FaceRecognizer
-from database import log_attendance, add_employee, remove_employee, sync_employees_with_face_db, init_db, get_current_status
+
+# Support both direct script execution and module import
+try:
+    from .detect import detect_faces
+    from .recognition import FaceRecognizer
+    from .database import log_attendance, add_employee, remove_employee, sync_employees_with_face_db, init_db, get_current_status
+except ImportError:
+    from detect import detect_faces
+    from recognition import FaceRecognizer
+    from database import log_attendance, add_employee, remove_employee, sync_employees_with_face_db, init_db, get_current_status
 
 # --- TỰ ĐỘNG PHÁT HIỆN PLATFORM ---
 IS_WINDOWS = platform.system() == "Windows"
@@ -17,11 +24,13 @@ IS_PI = platform.system() == "Linux" and os.path.exists("/proc/device-tree/model
 
 # --- CẤU HÌNH ---
 COOLDOWN_SECONDS = 60  # Thời gian chờ giữa 2 lần chấm công cho cùng 1 người
-HOLD_TIME_SECONDS = 2.0  # Thời gian giữ mặt trong camera trước khi chấm công (giây)
+HOLD_TIME_SECONDS = 1.5  # Thời gian giữ mặt trong camera trước khi chấm công (giây)
 ENABLE_WEB_SERVER = True  # Bật/tắt web dashboard
 WEB_PORT = 5000
-ENABLE_ANTISPOOF = False  # Tạm tắt anti-spoof để tiết kiệm RAM
-RECOGNITION_THRESHOLD = 0.4  # Threshold cho recognition (càng nhỏ càng chặt)
+ENABLE_ANTISPOOF = False  # Bật/tắt anti-spoofing
+
+# Threshold cho recognition:
+RECOGNITION_THRESHOLD = 0.55
 
 # --- CHẾ ĐỘ HOẠT ĐỘNG ---
 # Windows: GUI mode (có cửa sổ camera, có thể thêm/xóa thành viên)
@@ -62,7 +71,10 @@ def main():
         # Lazy loading: Chỉ load AntiSpoof nếu cần
         anti = None
         if ENABLE_ANTISPOOF:
-            from antispoof import AntiSpoof
+            try:
+                from .antispoof import AntiSpoof
+            except ImportError:
+                from antispoof import AntiSpoof
             anti = AntiSpoof()
         
         recognizer = FaceRecognizer()
