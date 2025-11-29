@@ -4,6 +4,7 @@ import numpy as np
 import os
 import sys
 import pickle
+import platform as _platform
 
 # Support both direct script execution and module import
 try:
@@ -11,8 +12,18 @@ try:
 except ImportError:
     from tflite_helper import get_interpreter
 
+# Detect platform
+_IS_PI = _platform.system() == "Linux" and os.path.exists("/proc/device-tree/model")
+
 class FaceRecognizer:
-    def __init__(self, model_path="models/recognition/MobileFaceNet.tflite", db_path="face_db.pkl"):
+    def __init__(self, model_path="models/recognition/MobileFaceNet.tflite", db_path="face_db.pkl", 
+                 enable_histogram_eq=None):
+        """
+        Args:
+            model_path: Đường dẫn model TFLite
+            db_path: Đường dẫn database embeddings
+            enable_histogram_eq: Bật histogram equalization (None=auto: tắt trên Pi để tiết kiệm CPU)
+        """
         self.interpreter = get_interpreter(model_path)
         self.interpreter.allocate_tensors()
         self.input_details = self.interpreter.get_input_details()
@@ -25,6 +36,12 @@ class FaceRecognizer:
         self.input_width = input_shape[2]
         
         self.db_path = db_path
+        
+        # Histogram equalization: tắt mặc định trên Pi để tiết kiệm CPU (~5-10ms/frame)
+        if enable_histogram_eq is None:
+            self.enable_histogram_eq = not _IS_PI
+        else:
+            self.enable_histogram_eq = enable_histogram_eq
 
         if os.path.exists(db_path):
             with open(db_path, "rb") as f:
@@ -53,7 +70,7 @@ class FaceRecognizer:
         """
         Preprocess face với các bước cải thiện chất lượng:
         1. Resize về kích thước model
-        2. Histogram equalization để cân bằng ánh sáng
+        2. Histogram equalization để cân bằng ánh sáng (optional, tắt trên Pi)
         3. Normalize theo chuẩn MobileFaceNet [-1, 1]
         """
         # Resize
@@ -62,11 +79,12 @@ class FaceRecognizer:
         # Convert to RGB
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         
-        # Histogram equalization trên mỗi channel để cải thiện contrast
-        # (đặc biệt hữu ích khi đeo kính hoặc ánh sáng không đều)
-        img_yuv = cv2.cvtColor(img, cv2.COLOR_RGB2YUV)
-        img_yuv[:,:,0] = cv2.equalizeHist(img_yuv[:,:,0])
-        img = cv2.cvtColor(img_yuv, cv2.COLOR_YUV2RGB)
+        # Histogram equalization (optional - tốn ~5-10ms trên Pi)
+        # Hữu ích khi đeo kính hoặc ánh sáng không đều
+        if self.enable_histogram_eq:
+            img_yuv = cv2.cvtColor(img, cv2.COLOR_RGB2YUV)
+            img_yuv[:,:,0] = cv2.equalizeHist(img_yuv[:,:,0])
+            img = cv2.cvtColor(img_yuv, cv2.COLOR_YUV2RGB)
         
         # Normalize to [-1, 1] (chuẩn MobileFaceNet)
         img = img.astype(np.float32)
@@ -199,6 +217,9 @@ class FaceRecognizer:
         """Lấy danh sách tên đã đăng ký"""
         return list(self.db.keys())
 
-    def save_db(self, db_path="face_db.pkl"):
+    def save_db(self, db_path=None):
+        """Lưu database ra file. Sử dụng self.db_path nếu không chỉ định."""
+        if db_path is None:
+            db_path = self.db_path
         with open(db_path, "wb") as f:
             pickle.dump(self.db, f)

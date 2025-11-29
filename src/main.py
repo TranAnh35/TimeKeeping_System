@@ -7,6 +7,27 @@ import gc
 import sys
 import platform
 import threading
+import logging
+
+# --- CẤU HÌNH LOGGING ---
+# Log ra file trên Pi để debug từ xa
+IS_WINDOWS_EARLY = platform.system() == "Windows"
+if not IS_WINDOWS_EARLY:
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('attendance.log', encoding='utf-8'),
+            logging.StreamHandler()
+        ]
+    )
+else:
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+
+logger = logging.getLogger(__name__)
 
 # Support both direct script execution and module import
 try:
@@ -52,6 +73,28 @@ def start_web_server():
     except Exception:
         pass  # Lỗi web server không ảnh hưởng chấm công chính
 
+def init_camera(max_retries=3, retry_delay=2):
+    """Khởi tạo camera với retry logic"""
+    for attempt in range(max_retries):
+        cap = cv2.VideoCapture(0)
+        if cap.isOpened():
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            # Thêm cấu hình cho Pi camera
+            if IS_PI:
+                cap.set(cv2.CAP_PROP_FPS, 15)  # Giảm FPS để ổn định
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+            # Warm-up camera - đọc vài frame đầu để ổn định
+            for _ in range(5):
+                cap.grab()
+            return cap
+        
+        print(f"⚠️ Camera không sẵn sàng, thử lại ({attempt + 1}/{max_retries})...")
+        time.sleep(retry_delay)
+    
+    return None
+
 def main():
     # 0. Khởi tạo Database
     init_db()
@@ -61,11 +104,11 @@ def main():
         web_thread = threading.Thread(target=start_web_server, daemon=True)
         web_thread.start()
     
-    # 1. Khởi tạo Camera và Models
-    cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    # 1. Khởi tạo Camera với retry
+    cap = init_camera()
+    if cap is None:
+        print("❌ Không thể kết nối camera sau nhiều lần thử!")
+        return
 
     try:
         # Lazy loading: Chỉ load AntiSpoof nếu cần
@@ -86,7 +129,7 @@ def main():
         gc.collect()
         
     except Exception as e:
-        print(f"❌ Lỗi khởi tạo: {e}")
+        logger.error(f"Lỗi khởi tạo: {e}")
         return
 
     # Dictionary lưu thời gian chấm công gần nhất
@@ -134,7 +177,7 @@ def main():
         while True:
             ret, frame = cap.read()
             if not ret:
-                print("Không đọc được camera!")
+                logger.warning("Không đọc được camera!")
                 break
             
             frame_count += 1
@@ -235,7 +278,7 @@ def main():
                                 
                                 # Log ngắn gọn
                                 symbol = "🟢" if action == 'check_in' else "🔴"
-                                print(f"{symbol} {label} - {action.upper().replace('_', '-')}")
+                                logger.info(f"{symbol} {label} - {action.upper().replace('_', '-')}")
                                 
                                 if not HEADLESS_MODE:
                                     if action == 'check_in':
@@ -257,7 +300,7 @@ def main():
                 # HEADLESS MODE (Pi): Log định kỳ mỗi 5 phút
                 current_time = time.time()
                 if current_time - last_status_time > 300:  # 5 phút
-                    print(f"[{datetime.datetime.now().strftime('%H:%M')}] ♻️ Running...")
+                    logger.info(f"♻️ Running... Faces detected: {len(detections)}")
                     last_status_time = current_time
             else:
                 # GUI MODE (Windows): Hiển thị cửa sổ camera và xử lý phím

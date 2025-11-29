@@ -3,18 +3,27 @@
 Module quản lý database SQLite cho hệ thống chấm công THEO GIỜ.
 Hỗ trợ check-in/check-out và tính tổng giờ làm việc.
 Xử lý ca làm việc xuyên đêm (overnight).
+Thread-safe cho multi-threaded access (main + web server).
 """
 import sqlite3
 import os
+import threading
 from datetime import datetime, timedelta
 
 DB_PATH = "attendance.db"
 
+# Thread-local storage cho connections
+_local = threading.local()
+
 def get_connection():
-    """Tạo kết nối đến database"""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row  # Trả về dict thay vì tuple
-    return conn
+    """
+    Tạo kết nối đến database (thread-safe).
+    Mỗi thread sẽ có connection riêng.
+    """
+    if not hasattr(_local, 'connection') or _local.connection is None:
+        _local.connection = sqlite3.connect(DB_PATH, check_same_thread=False)
+        _local.connection.row_factory = sqlite3.Row  # Trả về dict thay vì tuple
+    return _local.connection
 
 def init_db():
     """Khởi tạo database và bảng nếu chưa có"""

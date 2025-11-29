@@ -17,12 +17,15 @@ MODEL_PATH = "models/detection/version-RFB-320_without_postprocessing.tflite"
 class UltraLightFaceDetector:
     def __init__(self, model_path=MODEL_PATH, conf_threshold=0.6):
         self.conf_threshold = conf_threshold
+        self._priors_cache = None  # Cache priors để tránh tính lại mỗi frame
         try:
             self.interpreter = get_interpreter(model_path)
             self.interpreter.allocate_tensors()
             self.input_details = self.interpreter.get_input_details()
             self.output_details = self.interpreter.get_output_details()
             self.input_shape = (320, 240)
+            # Pre-generate priors một lần duy nhất
+            self._priors_cache = self._generate_priors(self.input_shape)
         except Exception as e:
             print(f"[LỖI] Detection model: {e}")
             self.interpreter = None
@@ -65,9 +68,8 @@ class UltraLightFaceDetector:
         if len(scores) == 0:
             return []
 
-        # 5. Generate Priors
-        priors = self._generate_priors(self.input_shape)
-        priors = priors[mask]
+        # 5. Sử dụng cached Priors (đã pre-generate)
+        priors = self._priors_cache[mask]
 
         # Decode Boxes
         variances = [0.1, 0.2]
