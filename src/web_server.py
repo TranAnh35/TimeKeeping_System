@@ -17,7 +17,8 @@ try:
         get_all_employees,
         get_today_sessions,
         get_active_members,
-        export_to_csv
+        export_to_csv,
+        get_anomaly_sessions
     )
 except ImportError:
     from database import (
@@ -27,7 +28,8 @@ except ImportError:
         get_all_employees,
         get_today_sessions,
         get_active_members,
-        export_to_csv
+        export_to_csv,
+        get_anomaly_sessions
     )
 
 app = Flask(__name__)
@@ -278,6 +280,18 @@ def api_members():
     """API lấy danh sách thành viên đã đăng ký"""
     employees = get_all_employees()
     return jsonify([{'name': e['name']} for e in employees])
+
+@app.route('/api/anomalies')
+def api_anomalies():
+    """
+    API lấy các session bất thường (7 ngày gần nhất).
+    Returns:
+        - auto_checkouts: Sessions bị auto check-out (quên checkout)
+        - long_sessions: Sessions dài bất thường (> 10 giờ)
+        - overnight_sessions: Sessions qua đêm
+    """
+    days = request.args.get('days', 7, type=int)
+    return jsonify(get_anomaly_sessions(days))
 
 @app.route('/export')
 def export():

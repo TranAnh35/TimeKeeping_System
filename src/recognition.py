@@ -150,6 +150,10 @@ class FaceRecognizer:
                 'matches': len([d for d in distances if d < threshold])
             }
         
+        # Kiểm tra nếu không có kết quả
+        if not person_scores:
+            return None, float('inf')
+        
         # Tìm người có avg_dist nhỏ nhất
         best_label = min(person_scores, key=lambda x: person_scores[x]['avg_dist'])
         best_info = person_scores[best_label]

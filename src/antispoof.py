@@ -51,7 +51,8 @@ class AntiSpoof:
         self.last_logits = logits
         self.last_probs = probs
         
-        predicted_class = np.argmax(probs)
+        # Giải phóng bộ nhớ tạm
+        del img, input_data, output, exp_logits
         
         real_prob = probs[2]
         

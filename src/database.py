@@ -12,18 +12,18 @@ from datetime import datetime, timedelta
 
 DB_PATH = "attendance.db"
 
-# Thread-local storage cho connections
-_local = threading.local()
+# Lock để đảm bảo thread-safe khi write
+_db_lock = threading.Lock()
 
 def get_connection():
     """
-    Tạo kết nối đến database (thread-safe).
-    Mỗi thread sẽ có connection riêng.
+    Tạo kết nối MỚI đến database mỗi lần gọi.
+    SQLite hỗ trợ multiple readers, single writer.
+    Dùng với 'with' statement hoặc nhớ close() sau khi dùng.
     """
-    if not hasattr(_local, 'connection') or _local.connection is None:
-        _local.connection = sqlite3.connect(DB_PATH, check_same_thread=False)
-        _local.connection.row_factory = sqlite3.Row  # Trả về dict thay vì tuple
-    return _local.connection
+    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    conn.row_factory = sqlite3.Row  # Trả về dict thay vì tuple
+    return conn
 
 def init_db():
     """Khởi tạo database và bảng nếu chưa có"""
@@ -52,6 +52,7 @@ def init_db():
     ''')
     
     # Bảng sessions - lưu các phiên làm việc (check_in -> check_out)
+    # Thêm cột is_auto_checkout để đánh dấu session bị auto check-out
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS work_sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,9 +60,16 @@ def init_db():
             check_in_time DATETIME NOT NULL,
             check_out_time DATETIME,
             duration_minutes INTEGER DEFAULT 0,
-            is_overnight INTEGER DEFAULT 0
+            is_overnight INTEGER DEFAULT 0,
+            is_auto_checkout INTEGER DEFAULT 0
         )
     ''')
+    
+    # Migration: Thêm cột is_auto_checkout nếu chưa có (cho DB cũ)
+    try:
+        cursor.execute('ALTER TABLE work_sessions ADD COLUMN is_auto_checkout INTEGER DEFAULT 0')
+    except sqlite3.OperationalError:
+        pass  # Cột đã tồn tại
     
     conn.commit()
     conn.close()
@@ -155,7 +163,7 @@ def check_out(name):
     conn.close()
     return 'check_out'
 
-def _do_checkout(cursor, session_id, checkout_time):
+def _do_checkout(cursor, session_id, checkout_time, is_auto=False):
     """Helper: Thực hiện checkout cho một session"""
     cursor.execute('SELECT check_in_time FROM work_sessions WHERE id = ?', (session_id,))
     row = cursor.fetchone()
@@ -166,9 +174,131 @@ def _do_checkout(cursor, session_id, checkout_time):
         
         cursor.execute('''
             UPDATE work_sessions 
-            SET check_out_time = ?, duration_minutes = ?, is_overnight = ?
+            SET check_out_time = ?, duration_minutes = ?, is_overnight = ?, is_auto_checkout = ?
             WHERE id = ?
-        ''', (checkout_time, duration, is_overnight, session_id))
+        ''', (checkout_time, duration, is_overnight, 1 if is_auto else 0, session_id))
+
+
+def midnight_checkout_all_sessions():
+    """
+    Tự động check-out TẤT CẢ sessions đang mở vào lúc 00:00 (nửa đêm).
+    
+    Logic:
+        - Tìm tất cả sessions check-in TRƯỚC ngày hôm nay và chưa checkout
+        - Check-out time = 23:59:59 của ngày check-in
+        - Duration = từ check_in đến 23:59:59
+        - Đánh dấu is_auto_checkout = 1
+    
+    Returns:
+        list: Danh sách các session đã được auto check-out
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    today = datetime.now().date()
+    
+    # Tìm các session đang mở và check-in TRƯỚC ngày hôm nay
+    cursor.execute('''
+        SELECT id, name, check_in_time FROM work_sessions 
+        WHERE check_out_time IS NULL 
+          AND date(check_in_time) < date(?)
+    ''', (today,))
+    
+    open_sessions = cursor.fetchall()
+    auto_checked_out = []
+    
+    for session in open_sessions:
+        session_id = session['id']
+        name = session['name']
+        checkin_time = _parse_datetime(session['check_in_time'])
+        
+        # Auto check-out time = 23:59:59 của ngày check-in
+        checkout_time = datetime.combine(checkin_time.date(), datetime.max.time().replace(microsecond=0))
+        
+        # Tính duration thực tế (từ check-in đến 23:59:59)
+        duration = int((checkout_time - checkin_time).total_seconds() / 60)
+        
+        cursor.execute('''
+            UPDATE work_sessions 
+            SET check_out_time = ?, duration_minutes = ?, is_overnight = 0, is_auto_checkout = 1
+            WHERE id = ?
+        ''', (checkout_time, duration, session_id))
+        
+        # Log vào attendance với status đặc biệt
+        cursor.execute('''
+            INSERT INTO attendance (name, timestamp, date, time, status)
+            VALUES (?, ?, ?, ?, 'midnight_checkout')
+        ''', (name, checkout_time, 
+              checkout_time.strftime("%Y-%m-%d"), 
+              checkout_time.strftime("%H:%M:%S")))
+        
+        hours = duration // 60
+        mins = duration % 60
+        auto_checked_out.append({
+            'name': name,
+            'check_in_time': session['check_in_time'],
+            'checkout_time': checkout_time.strftime("%Y-%m-%d %H:%M:%S"),
+            'duration_minutes': duration,
+            'duration_str': f"{hours}h {mins}m"
+        })
+    
+    conn.commit()
+    conn.close()
+    
+    return auto_checked_out
+
+
+def get_anomaly_sessions(days=7):
+    """
+    Lấy danh sách các session bất thường để báo cáo.
+    
+    Returns:
+        dict: {
+            'auto_checkouts': [...],  # Các session bị auto check-out
+            'long_sessions': [...],   # Các session > 10 giờ
+            'overnight_sessions': [...]  # Các session qua đêm
+        }
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    
+    # Sessions bị auto check-out
+    cursor.execute('''
+        SELECT name, check_in_time, check_out_time, duration_minutes 
+        FROM work_sessions 
+        WHERE is_auto_checkout = 1 AND date(check_in_time) >= ?
+        ORDER BY check_in_time DESC
+    ''', (start_date,))
+    auto_checkouts = [dict(row) for row in cursor.fetchall()]
+    
+    # Sessions dài bất thường (> 10 giờ)
+    cursor.execute('''
+        SELECT name, check_in_time, check_out_time, duration_minutes 
+        FROM work_sessions 
+        WHERE duration_minutes > 600 AND date(check_in_time) >= ?
+        ORDER BY duration_minutes DESC
+    ''', (start_date,))
+    long_sessions = [dict(row) for row in cursor.fetchall()]
+    
+    # Sessions qua đêm
+    cursor.execute('''
+        SELECT name, check_in_time, check_out_time, duration_minutes 
+        FROM work_sessions 
+        WHERE is_overnight = 1 AND date(check_in_time) >= ?
+        ORDER BY check_in_time DESC
+    ''', (start_date,))
+    overnight_sessions = [dict(row) for row in cursor.fetchall()]
+    
+    conn.close()
+    
+    return {
+        'auto_checkouts': auto_checkouts,
+        'long_sessions': long_sessions,
+        'overnight_sessions': overnight_sessions
+    }
+
 
 def smart_attendance(name):
     """

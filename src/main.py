@@ -33,37 +33,153 @@ logger = logging.getLogger(__name__)
 try:
     from .detect import detect_faces
     from .recognition import FaceRecognizer
-    from .database import log_attendance, add_employee, remove_employee, sync_employees_with_face_db, init_db, get_current_status
+    from .database import (log_attendance, add_employee, remove_employee, 
+                           sync_employees_with_face_db, init_db,
+                           midnight_checkout_all_sessions)
+    from .config import CONFIG
 except ImportError:
     from detect import detect_faces
     from recognition import FaceRecognizer
-    from database import log_attendance, add_employee, remove_employee, sync_employees_with_face_db, init_db, get_current_status
+    from database import (log_attendance, add_employee, remove_employee, 
+                          sync_employees_with_face_db, init_db,
+                          midnight_checkout_all_sessions)
+    from config import CONFIG
 
 # --- TỰ ĐỘNG PHÁT HIỆN PLATFORM ---
 IS_WINDOWS = platform.system() == "Windows"
 IS_PI = platform.system() == "Linux" and os.path.exists("/proc/device-tree/model")
 
 # --- CẤU HÌNH ---
-COOLDOWN_SECONDS = 60  # Thời gian chờ giữa 2 lần chấm công cho cùng 1 người
-HOLD_TIME_SECONDS = 1.5  # Thời gian giữ mặt trong camera trước khi chấm công (giây)
-ENABLE_WEB_SERVER = True  # Bật/tắt web dashboard
-WEB_PORT = 5000
-ENABLE_ANTISPOOF = False  # Bật/tắt anti-spoofing
+# Các giá trị mặc định được lấy từ 'config/config.json' qua module `src/config.py` (CONFIG dict)
+COOLDOWN_SECONDS = int(CONFIG.get('COOLDOWN_SECONDS', 300))  # seconds
+HOLD_TIME_SECONDS = float(CONFIG.get('HOLD_TIME_SECONDS', 1.5))  # seconds
+ENABLE_WEB_SERVER = bool(CONFIG.get('ENABLE_WEB_SERVER', True))
+WEB_PORT = int(CONFIG.get('WEB_PORT', 5000))
+ENABLE_ANTISPOOF = bool(CONFIG.get('ENABLE_ANTISPOOF', False))
 
 # Threshold cho recognition:
-RECOGNITION_THRESHOLD = 0.55
+RECOGNITION_THRESHOLD = float(CONFIG.get('RECOGNITION_THRESHOLD', 0.55))
 
-# --- CHẾ ĐỘ HOẠT ĐỘNG ---
-# Windows: GUI mode (có cửa sổ camera, có thể thêm/xóa thành viên)
-# Pi: Headless mode (không GUI, chỉ chấm công, quản lý qua web)
-HEADLESS_MODE = not IS_WINDOWS  # Tự động: Pi = headless, Windows = GUI
+# --- CHẾ ĐỘ HIỂN THỊ (GUI) ---
+# FORCE_GUI_MODE: Bật này để hiển thị cửa sổ camera trên Pi (kết nối màn hình HDMI)
+FORCE_GUI_MODE = bool(CONFIG.get('FORCE_GUI_MODE', False))  # Đặt True khi muốn debug trên Pi với màn hình
+
+# Chế độ hoạt động: Windows luôn có GUI, Pi mặc định headless (trừ khi FORCE_GUI)
+HEADLESS_MODE = not IS_WINDOWS and not FORCE_GUI_MODE
+
+# --- CẤU HÌNH AUTO CHECK-OUT LÚC NỬA ĐÊM ---
+# Tự động check-out tất cả sessions đang mở vào lúc 00:00 mỗi ngày
+ENABLE_MIDNIGHT_CHECKOUT = bool(CONFIG.get('ENABLE_MIDNIGHT_CHECKOUT', True))
 
 # --- CẤU HÌNH TỐI ƯU RAM (cho Pi 3) ---
-LOW_MEMORY_MODE = IS_PI  # Tự động bật trên Pi
-CAMERA_WIDTH = 640 if not LOW_MEMORY_MODE else 320
-CAMERA_HEIGHT = 480 if not LOW_MEMORY_MODE else 240
-FRAME_SKIP = 1 if not LOW_MEMORY_MODE else 2
-GC_INTERVAL = 30
+LOW_MEMORY_MODE = bool(CONFIG.get('LOW_MEMORY_MODE', IS_PI))  # Tự động bật trên Pi (có thể override từ file config)
+CAMERA_WIDTH = int(CONFIG.get('CAMERA_WIDTH', 640 if not LOW_MEMORY_MODE else 320))
+CAMERA_HEIGHT = int(CONFIG.get('CAMERA_HEIGHT', 480 if not LOW_MEMORY_MODE else 240))
+GC_INTERVAL = int(CONFIG.get('GC_INTERVAL', 30))
+
+# --- ADAPTIVE FRAME SKIP ---
+# Tự động điều chỉnh số frame bỏ qua dựa trên tải CPU
+ENABLE_ADAPTIVE_SKIP = bool(CONFIG.get('ENABLE_ADAPTIVE_SKIP', IS_PI))  # Chỉ bật trên Pi
+TARGET_PROCESS_TIME = float(CONFIG.get('TARGET_PROCESS_TIME', 0.15))  # Mục tiêu: xử lý mỗi frame trong 150ms
+MIN_FRAME_SKIP = int(CONFIG.get('MIN_FRAME_SKIP', 1))
+MAX_FRAME_SKIP = int(CONFIG.get('MAX_FRAME_SKIP', 5))
+DEFAULT_FRAME_SKIP = int(CONFIG.get('DEFAULT_FRAME_SKIP', 2 if IS_PI else 1))
+
+
+class AdaptiveFrameSkip:
+    """
+    Tự động điều chỉnh frame skip dựa trên thời gian xử lý thực tế.
+    - CPU nhàn rỗi → giảm skip (xử lý nhiều frame hơn, mượt hơn)
+    - CPU quá tải → tăng skip (giảm tải, tránh lag)
+    """
+    def __init__(self, target_time=TARGET_PROCESS_TIME, 
+                 min_skip=MIN_FRAME_SKIP, max_skip=MAX_FRAME_SKIP,
+                 initial_skip=DEFAULT_FRAME_SKIP):
+        self.target_time = target_time
+        self.min_skip = min_skip
+        self.max_skip = max_skip
+        self.current_skip = initial_skip
+        
+        # Smoothing: dùng moving average để tránh dao động
+        self.time_history = []
+        self.history_size = 5
+        
+        # Stats
+        self.total_frames = 0
+        self.processed_frames = 0
+        self.last_adjust_time = time.time()
+        self.adjust_interval = 2.0  # Điều chỉnh mỗi 2 giây
+    
+    def update(self, process_time):
+        """
+        Cập nhật thời gian xử lý và điều chỉnh skip rate.
+        
+        Args:
+            process_time: Thời gian xử lý frame vừa rồi (giây)
+        """
+        self.time_history.append(process_time)
+        if len(self.time_history) > self.history_size:
+            self.time_history.pop(0)
+        
+        self.processed_frames += 1
+        
+        # Chỉ điều chỉnh mỗi adjust_interval giây
+        current_time = time.time()
+        if current_time - self.last_adjust_time < self.adjust_interval:
+            return self.current_skip
+        
+        self.last_adjust_time = current_time
+        
+        # Tính trung bình thời gian xử lý
+        avg_time = sum(self.time_history) / len(self.time_history)
+        
+        old_skip = self.current_skip
+        
+        # Điều chỉnh skip dựa trên tỉ lệ với target
+        if avg_time < self.target_time * 0.5:
+            # CPU rất nhàn rỗi (<75ms) → giảm skip nhiều
+            self.current_skip = max(self.min_skip, self.current_skip - 1)
+        elif avg_time < self.target_time * 0.8:
+            # CPU nhàn rỗi (<120ms) → giảm skip nhẹ
+            if self.current_skip > self.min_skip:
+                self.current_skip -= 1
+        elif avg_time > self.target_time * 1.5:
+            # CPU quá tải (>225ms) → tăng skip nhiều
+            self.current_skip = min(self.max_skip, self.current_skip + 2)
+        elif avg_time > self.target_time * 1.2:
+            # CPU hơi cao (>180ms) → tăng skip nhẹ
+            self.current_skip = min(self.max_skip, self.current_skip + 1)
+        
+        # Log khi thay đổi
+        if old_skip != self.current_skip:
+            logger.debug(f"Adaptive skip: {old_skip} → {self.current_skip} (avg={avg_time*1000:.0f}ms)")
+        
+        return self.current_skip
+    
+    def should_process(self, frame_count):
+        """
+        Kiểm tra frame này có nên xử lý không.
+        
+        Returns:
+            True nếu nên xử lý frame này
+        """
+        self.total_frames += 1
+        return frame_count % self.current_skip == 0
+    
+    def get_stats(self):
+        """Lấy thống kê hiệu suất"""
+        if self.total_frames == 0:
+            return "No stats yet"
+        
+        avg_time = sum(self.time_history) / len(self.time_history) if self.time_history else 0
+        skip_rate = (self.total_frames - self.processed_frames) / self.total_frames * 100
+        
+        return {
+            'current_skip': self.current_skip,
+            'avg_process_ms': avg_time * 1000,
+            'skip_rate_percent': skip_rate,
+            'effective_fps': self.processed_frames / max(1, self.total_frames) * 15  # Giả sử camera 15fps
+        }
 
 def start_web_server():
     """Chạy web server trong thread riêng"""
@@ -141,16 +257,35 @@ def main():
     print("🕐 HỆ THỐNG CHẤM CÔNG")
     print("="*50)
     
-    mode = "Windows (GUI)" if IS_WINDOWS else "Pi (Headless)"
+    # Hiển thị mode chi tiết hơn
+    if IS_WINDOWS:
+        mode = "Windows (GUI)"
+    elif FORCE_GUI_MODE:
+        mode = "Pi (GUI - debug mode)"
+    else:
+        mode = "Pi (Headless)"
+    
     n_people, n_emb = recognizer.get_db_info()
     print(f"📍 Mode: {mode}")
     print(f"👥 Database: {n_people} người ({n_emb} ảnh)")
+    print(f"⏱️ Cooldown: {COOLDOWN_SECONDS}s ({COOLDOWN_SECONDS//60}m)")
     
     if sync_result['added'] or sync_result['removed']:
         print(f"🔄 Sync: +{sync_result['added']} -{sync_result['removed']}")
     
     if LOW_MEMORY_MODE:
-        print(f"💾 Low-RAM: {CAMERA_WIDTH}x{CAMERA_HEIGHT}, skip={FRAME_SKIP}")
+        print(f"💾 Low-RAM: {CAMERA_WIDTH}x{CAMERA_HEIGHT}")
+    
+    if ENABLE_ADAPTIVE_SKIP:
+        print(f"⚡ Adaptive Skip: ON (target={int(TARGET_PROCESS_TIME*1000)}ms, range={MIN_FRAME_SKIP}-{MAX_FRAME_SKIP})")
+    else:
+        print(f"⚡ Frame Skip: {DEFAULT_FRAME_SKIP} (fixed)")
+    
+    if ENABLE_MIDNIGHT_CHECKOUT:
+        print(f"⏰ Auto Checkout: ON (00:00 mỗi ngày)")
+
+    # Log cơ bản từ config để xác nhận
+    logger.info(f"CONFIG: COOLDOWN={COOLDOWN_SECONDS}s, HOLD_TIME={HOLD_TIME_SECONDS}s, WEB={ENABLE_WEB_SERVER}:{WEB_PORT}, ANTISPOOF={ENABLE_ANTISPOOF}")
     
     if ENABLE_WEB_SERVER:
         import socket
@@ -172,6 +307,17 @@ def main():
 
     frame_count = 0
     last_status_time = 0
+    last_midnight_check = datetime.datetime.now().date()  # Ngày cuối cùng đã kiểm tra midnight
+    
+    # Khởi tạo Adaptive Frame Skip
+    adaptive_skip = AdaptiveFrameSkip() if ENABLE_ADAPTIVE_SKIP else None
+    
+    # Kiểm tra midnight checkout ngay khi khởi động (cho sessions từ hôm qua)
+    if ENABLE_MIDNIGHT_CHECKOUT:
+        auto_results = midnight_checkout_all_sessions()
+        if auto_results:
+            for r in auto_results:
+                logger.warning(f"⚠️ Midnight checkout: {r['name']} ({r['duration_str']})")
     
     try:
         while True:
@@ -181,14 +327,33 @@ def main():
                 break
             
             frame_count += 1
+            current_time = time.time()
+            
+            # Kiểm tra midnight checkout khi sang ngày mới
+            if ENABLE_MIDNIGHT_CHECKOUT:
+                today = datetime.datetime.now().date()
+                if today > last_midnight_check:
+                    auto_results = midnight_checkout_all_sessions()
+                    if auto_results:
+                        for r in auto_results:
+                            logger.warning(f"⚠️ Midnight checkout: {r['name']} ({r['duration_str']})")
+                    last_midnight_check = today
             
             # Skip frames để tiết kiệm CPU/RAM
-            if frame_count % FRAME_SKIP != 0:
+            if ENABLE_ADAPTIVE_SKIP and adaptive_skip:
+                should_process = adaptive_skip.should_process(frame_count)
+            else:
+                should_process = (frame_count % DEFAULT_FRAME_SKIP == 0)
+            
+            if not should_process:
                 if not HEADLESS_MODE:
                     cv2.imshow("May Cham Cong", frame)
                     if cv2.waitKey(1) & 0xFF == ord('q'):
                         break
                 continue
+            
+            # Bắt đầu đo thời gian xử lý
+            process_start_time = time.time()
             
             # Garbage collection định kỳ
             if frame_count % GC_INTERVAL == 0:
@@ -273,8 +438,10 @@ def main():
                             if label not in last_checkin or (current_time - last_checkin[label] > COOLDOWN_SECONDS):
                                 action = log_attendance(label)  # Returns 'check_in' or 'check_out'
                                 last_checkin[label] = current_time
-                                # Reset tracker sau khi chấm công
-                                face_hold_tracker[label] = current_time + COOLDOWN_SECONDS
+                                # Xóa khỏi tracker để tránh chấm công lại ngay
+                                # (sẽ được thêm lại nếu người đó vẫn trong frame sau cooldown)
+                                if label in face_hold_tracker:
+                                    del face_hold_tracker[label]
                                 
                                 # Log ngắn gọn
                                 symbol = "🟢" if action == 'check_in' else "🔴"
@@ -295,15 +462,33 @@ def main():
                 if name not in last_checkin or (time.time() - last_checkin.get(name, 0) > COOLDOWN_SECONDS):
                     del face_hold_tracker[name]
 
+            # --- CẬP NHẬT ADAPTIVE FRAME SKIP ---
+            if ENABLE_ADAPTIVE_SKIP and adaptive_skip:
+                process_time = time.time() - process_start_time
+                adaptive_skip.update(process_time)
+
             # --- PHẦN HIỂN THỊ VÀ ĐIỀU KHIỂN ---
             if HEADLESS_MODE:
                 # HEADLESS MODE (Pi): Log định kỳ mỗi 5 phút
                 current_time = time.time()
                 if current_time - last_status_time > 300:  # 5 phút
-                    logger.info(f"♻️ Running... Faces detected: {len(detections)}")
+                    # Thêm thông tin adaptive skip vào log
+                    if ENABLE_ADAPTIVE_SKIP and adaptive_skip:
+                        stats = adaptive_skip.get_stats()
+                        logger.info(f"♻️ Running... Faces: {len(detections)}, Skip: {stats['current_skip']}, Avg: {stats['avg_process_ms']:.0f}ms")
+                    else:
+                        logger.info(f"♻️ Running... Faces detected: {len(detections)}")
                     last_status_time = current_time
             else:
                 # GUI MODE (Windows): Hiển thị cửa sổ camera và xử lý phím
+                
+                # Hiển thị thông tin Adaptive Skip trên GUI
+                if ENABLE_ADAPTIVE_SKIP and adaptive_skip:
+                    stats = adaptive_skip.get_stats()
+                    info_text = f"Skip:{stats['current_skip']} | {stats['avg_process_ms']:.0f}ms | ~{stats['effective_fps']:.1f}fps"
+                    cv2.putText(frame, info_text, (10, frame.shape[0] - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+                
                 cv2.imshow("May Cham Cong", frame)
                 
                 key = cv2.waitKey(1) & 0xFF
