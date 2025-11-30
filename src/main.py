@@ -322,6 +322,8 @@ def main():
     print("="*50 + "\n")
 
     frame_count = 0
+    processed_frame_count = 0
+    fps_probe_start = time.time()
     last_status_time = 0
     last_midnight_check = datetime.datetime.now().date()  # Ngày cuối cùng đã kiểm tra midnight
     
@@ -380,6 +382,7 @@ def main():
             
             # Danh sách người được nhận diện trong frame này
             recognized_this_frame = set()
+            processed_frame_count += 1
 
             for det in detections:
                 x, y, w, h = det['box']
@@ -502,6 +505,17 @@ def main():
                     else:
                         logger.info(f"♻️ Running... Faces detected: {len(detections)}")
                     last_status_time = current_time
+
+                # Log FPS định kỳ để đo hiệu suất camera/pipeline
+                elapsed = time.time() - fps_probe_start
+                if elapsed >= 10:
+                    raw_fps = frame_count / elapsed
+                    processed_fps = processed_frame_count / elapsed if elapsed > 0 else 0
+                    logger.info(f"📹 FPS camera≈{raw_fps:.2f} | pipeline≈{processed_fps:.2f} | faces:{len(detections)}")
+                    fps_probe_start = time.time()
+                    frame_count = 0
+                    processed_frame_count = 0
+
             else:
                 # GUI MODE (Windows): Hiển thị cửa sổ camera và xử lý phím
                 
