@@ -1,8 +1,12 @@
 # src/main.py
+import os
+
+if os.environ.get("DISPLAY", "") == "":
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 import cv2
 import time
 import datetime
-import os
 import gc
 import sys
 import platform
