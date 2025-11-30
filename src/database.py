@@ -351,7 +351,6 @@ def sync_employees_with_face_db(valid_names):
     Đồng bộ bảng employees với danh sách tên từ face_db.pkl
     - Xóa những tên không còn trong face_db
     - Thêm những tên mới từ face_db
-    - Reset auto-increment sequence
     """
     conn = get_connection()
     cursor = conn.cursor()
@@ -370,11 +369,6 @@ def sync_employees_with_face_db(valid_names):
     to_add = valid_names_set - current_employees
     for name in to_add:
         cursor.execute('INSERT OR IGNORE INTO employees (name) VALUES (?)', (name,))
-    
-    # Reset sqlite_sequence cho employees
-    cursor.execute('SELECT COUNT(*) FROM employees')
-    count = cursor.fetchone()[0]
-    cursor.execute('UPDATE sqlite_sequence SET seq = ? WHERE name = ?', (count, 'employees'))
     
     conn.commit()
     conn.close()
@@ -588,3 +582,125 @@ def export_to_csv(output_path="export_attendance.csv", start_date=None, end_date
             ])
     
     return full_path
+
+
+# === UTILITY FUNCTIONS ===
+
+def audit_and_fix_sqlite_sequences(fix=False):
+    """
+    Kiểm tra và (tùy chọn) sửa sqlite_sequence cho tất cả bảng.
+    
+    sqlite_sequence.seq phải = MAX(id) của bảng, không phải COUNT(*).
+    
+    Args:
+        fix: Nếu True, tự động sửa các sequence sai. Nếu False, chỉ báo cáo.
+    
+    Returns:
+        dict: Báo cáo trạng thái của từng bảng
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    tables = ['employees', 'attendance', 'work_sessions']
+    report = {}
+    
+    for table in tables:
+        # Lấy MAX(id) từ bảng
+        cursor.execute(f'SELECT MAX(id) FROM {table}')
+        max_id = cursor.fetchone()[0] or 0
+        
+        # Lấy COUNT(*) từ bảng
+        cursor.execute(f'SELECT COUNT(*) FROM {table}')
+        count = cursor.fetchone()[0]
+        
+        # Lấy seq hiện tại từ sqlite_sequence
+        cursor.execute('SELECT seq FROM sqlite_sequence WHERE name = ?', (table,))
+        row = cursor.fetchone()
+        current_seq = row[0] if row else None
+        
+        # Kiểm tra
+        is_correct = (current_seq == max_id) if current_seq is not None else (max_id == 0)
+        
+        report[table] = {
+            'max_id': max_id,
+            'count': count,
+            'current_seq': current_seq,
+            'expected_seq': max_id,
+            'is_correct': is_correct
+        }
+        
+        # Sửa nếu cần
+        if fix and not is_correct and max_id > 0:
+            if current_seq is None:
+                cursor.execute('INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)', (table, max_id))
+            else:
+                cursor.execute('UPDATE sqlite_sequence SET seq = ? WHERE name = ?', (max_id, table))
+            report[table]['fixed'] = True
+    
+    if fix:
+        conn.commit()
+    
+    conn.close()
+    return report
+
+
+def get_database_health():
+    """
+    Kiểm tra sức khỏe tổng thể của database.
+    Returns dict với các metrics và warnings.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    health = {
+        'tables': {},
+        'warnings': [],
+        'status': 'healthy'
+    }
+    
+    # Kiểm tra từng bảng
+    for table in ['employees', 'attendance', 'work_sessions']:
+        cursor.execute(f'SELECT COUNT(*) FROM {table}')
+        count = cursor.fetchone()[0]
+        
+        cursor.execute(f'SELECT MAX(id) FROM {table}')
+        max_id = cursor.fetchone()[0] or 0
+        
+        health['tables'][table] = {
+            'count': count,
+            'max_id': max_id
+        }
+    
+    # Kiểm tra sqlite_sequence
+    seq_report = audit_and_fix_sqlite_sequences(fix=False)
+    for table, info in seq_report.items():
+        if not info['is_correct']:
+            health['warnings'].append(
+                f"sqlite_sequence.{table}: seq={info['current_seq']} but MAX(id)={info['max_id']}"
+            )
+            health['status'] = 'needs_attention'
+    
+    # Kiểm tra orphan sessions (sessions của employees đã bị xóa)
+    cursor.execute('''
+        SELECT DISTINCT ws.name 
+        FROM work_sessions ws 
+        LEFT JOIN employees e ON ws.name = e.name 
+        WHERE e.name IS NULL
+    ''')
+    orphan_names = [row[0] for row in cursor.fetchall()]
+    if orphan_names:
+        health['warnings'].append(f"Orphan sessions found for: {orphan_names}")
+    
+    # Kiểm tra sessions đang mở quá lâu (> 24h)
+    cursor.execute('''
+        SELECT name, check_in_time 
+        FROM work_sessions 
+        WHERE check_out_time IS NULL 
+          AND datetime(check_in_time) < datetime('now', '-24 hours')
+    ''')
+    stale_sessions = [dict(row) for row in cursor.fetchall()]
+    if stale_sessions:
+        health['warnings'].append(f"Stale open sessions (>24h): {len(stale_sessions)}")
+    
+    conn.close()
+    return health
