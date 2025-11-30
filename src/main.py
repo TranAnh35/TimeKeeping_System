@@ -322,13 +322,34 @@ def main():
     print("="*50 + "\n")
 
     frame_count = 0
+    captured_frame_count = 0
     processed_frame_count = 0
-    fps_probe_start = time.time()
+    fps_window_start = time.time()
     last_status_time = 0
     last_midnight_check = datetime.datetime.now().date()  # Ngày cuối cùng đã kiểm tra midnight
     
     # Khởi tạo Adaptive Frame Skip
     adaptive_skip = AdaptiveFrameSkip() if ENABLE_ADAPTIVE_SKIP else None
+
+    def maybe_log_fps(now, faces_in_frame):
+        """
+        Ghi log FPS camera và pipeline mỗi ~10 giây để đánh giá hiệu suất thực tế.
+        """
+        nonlocal fps_window_start, captured_frame_count, processed_frame_count
+        elapsed = now - fps_window_start
+        if elapsed < 10:
+            return
+        if elapsed <= 0:
+            return
+        camera_fps = captured_frame_count / elapsed
+        pipeline_fps = processed_frame_count / elapsed
+        skip_value = adaptive_skip.current_skip if ENABLE_ADAPTIVE_SKIP and adaptive_skip else DEFAULT_FRAME_SKIP
+        logger.info(
+            f"📹 FPS camera≈{camera_fps:.2f} | pipeline≈{pipeline_fps:.2f} | faces:{faces_in_frame} | skip:{skip_value}"
+        )
+        fps_window_start = now
+        captured_frame_count = 0
+        processed_frame_count = 0
     
     # Kiểm tra midnight checkout ngay khi khởi động (cho sessions từ hôm qua)
     if ENABLE_MIDNIGHT_CHECKOUT:
@@ -345,6 +366,7 @@ def main():
                 break
             
             frame_count += 1
+            captured_frame_count += 1
             current_time = time.time()
             
             # Kiểm tra midnight checkout khi sang ngày mới
@@ -368,6 +390,7 @@ def main():
                     cv2.imshow("May Cham Cong", frame)
                     if cv2.waitKey(1) & 0xFF == ord('q'):
                         break
+                maybe_log_fps(current_time, 0)
                 continue
             
             # Bắt đầu đo thời gian xử lý
@@ -379,6 +402,7 @@ def main():
 
             # detection module nhận BGR (chuẩn OpenCV)
             detections = detect_faces(frame)
+            processed_frame_count += 1
             
             # Danh sách người được nhận diện trong frame này
             recognized_this_frame = set()
@@ -507,15 +531,6 @@ def main():
                     last_status_time = current_time
 
                 # Log FPS định kỳ để đo hiệu suất camera/pipeline
-                elapsed = time.time() - fps_probe_start
-                if elapsed >= 10:
-                    raw_fps = frame_count / elapsed
-                    processed_fps = processed_frame_count / elapsed if elapsed > 0 else 0
-                    logger.info(f"📹 FPS camera≈{raw_fps:.2f} | pipeline≈{processed_fps:.2f} | faces:{len(detections)}")
-                    fps_probe_start = time.time()
-                    frame_count = 0
-                    processed_frame_count = 0
-
             else:
                 # GUI MODE (Windows): Hiển thị cửa sổ camera và xử lý phím
                 
@@ -586,6 +601,8 @@ def main():
                         
                         cv2.namedWindow("May Cham Cong")
                     
+            maybe_log_fps(time.time(), len(detections))
+            
     except KeyboardInterrupt:
         print("\n🛑 Đã dừng (Ctrl+C)")
     finally:
