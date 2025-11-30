@@ -26,12 +26,13 @@ DEFAULTS = {
     "LOW_MEMORY_MODE": None,
     "CAMERA_WIDTH": None,
     "CAMERA_HEIGHT": None,
-    "GC_INTERVAL": 30,
+    "GC_INTERVAL": 900,
     "ENABLE_ADAPTIVE_SKIP": None,
     "TARGET_PROCESS_TIME": 0.15,
     "MIN_FRAME_SKIP": 1,
     "MAX_FRAME_SKIP": 5,
-    "DEFAULT_FRAME_SKIP": None
+    "DEFAULT_FRAME_SKIP": None,
+    "TFLITE_NUM_THREADS": None
 }
 
 def _load_config(path):
@@ -67,6 +68,9 @@ if CONFIG['CAMERA_WIDTH'] is None or CONFIG['CAMERA_HEIGHT'] is None:
     else:
         CONFIG['CAMERA_WIDTH'] = 640
         CONFIG['CAMERA_HEIGHT'] = 480
+
+if CONFIG['TFLITE_NUM_THREADS'] is None:
+    CONFIG['TFLITE_NUM_THREADS'] = 2 if IS_PI else 4
 
 def get(key, default=None):
     return CONFIG.get(key, default)

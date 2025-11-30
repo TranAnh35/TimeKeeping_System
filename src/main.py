@@ -49,6 +49,12 @@ except ImportError:
 IS_WINDOWS = platform.system() == "Windows"
 IS_PI = platform.system() == "Linux" and os.path.exists("/proc/device-tree/model")
 
+if IS_PI:
+    try:
+        cv2.setNumThreads(1)
+    except Exception:
+        pass
+
 # --- CẤU HÌNH ---
 # Các giá trị mặc định được lấy từ 'config/config.json' qua module `src/config.py` (CONFIG dict)
 COOLDOWN_SECONDS = int(CONFIG.get('COOLDOWN_SECONDS', 300))  # seconds
@@ -66,6 +72,7 @@ FORCE_GUI_MODE = bool(CONFIG.get('FORCE_GUI_MODE', False))  # Đặt True khi mu
 
 # Chế độ hoạt động: Windows luôn có GUI, Pi mặc định headless (trừ khi FORCE_GUI)
 HEADLESS_MODE = not IS_WINDOWS and not FORCE_GUI_MODE
+OVERLAY_ENABLED = not HEADLESS_MODE
 
 # --- CẤU HÌNH AUTO CHECK-OUT LÚC NỬA ĐÊM ---
 # Tự động check-out tất cả sessions đang mở vào lúc 00:00 mỗi ngày
@@ -75,7 +82,12 @@ ENABLE_MIDNIGHT_CHECKOUT = bool(CONFIG.get('ENABLE_MIDNIGHT_CHECKOUT', True))
 LOW_MEMORY_MODE = bool(CONFIG.get('LOW_MEMORY_MODE', IS_PI))  # Tự động bật trên Pi (có thể override từ file config)
 CAMERA_WIDTH = int(CONFIG.get('CAMERA_WIDTH', 640 if not LOW_MEMORY_MODE else 320))
 CAMERA_HEIGHT = int(CONFIG.get('CAMERA_HEIGHT', 480 if not LOW_MEMORY_MODE else 240))
-GC_INTERVAL = int(CONFIG.get('GC_INTERVAL', 30))
+GC_INTERVAL = int(CONFIG.get('GC_INTERVAL', 900))
+if GC_INTERVAL < 0:
+    GC_INTERVAL = 0
+if IS_PI and 0 < GC_INTERVAL < 600:
+    logger.debug("Điều chỉnh GC_INTERVAL lên 600 frames để giảm nghẽn trên Pi")
+    GC_INTERVAL = 600
 
 # --- ADAPTIVE FRAME SKIP ---
 # Tự động điều chỉnh số frame bỏ qua dựa trên tải CPU
@@ -356,7 +368,7 @@ def main():
             process_start_time = time.time()
             
             # Garbage collection định kỳ
-            if frame_count % GC_INTERVAL == 0:
+            if GC_INTERVAL and frame_count and frame_count % GC_INTERVAL == 0:
                 gc.collect()
 
             # detection module nhận BGR (chuẩn OpenCV)
@@ -384,22 +396,26 @@ def main():
                 # --- BƯỚC 2: Recognition ---
                 label, distance = recognizer.recognize(face, threshold=RECOGNITION_THRESHOLD)
                 
-                # Hiển thị distance để debug
-                dist_text = f"d={distance:.2f}" if distance < float('inf') else ""
+                # Hiển thị distance để debug (chỉ khi có GUI)
+                dist_text = ""
+                if OVERLAY_ENABLED and distance < float('inf'):
+                    dist_text = f"d={distance:.2f}"
                 
                 if not is_real:
                     # FAKE: Màu đỏ
-                    cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 0, 255), 2)
-                    name_text = label if label else "Unknown"
-                    cv2.putText(frame, f"FAKE - {name_text}", (x, y-10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    if OVERLAY_ENABLED:
+                        cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 0, 255), 2)
+                        name_text = label if label else "Unknown"
+                        cv2.putText(frame, f"FAKE - {name_text}", (x, y-10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                 else:
                     # REAL: Xử lý theo có nhận diện được hay không
                     if label is None:
                         # Người lạ (Vàng) - chưa đăng ký hoặc distance quá xa
-                        cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 255), 2)
-                        cv2.putText(frame, f"Unknown {dist_text}", (x, y-10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                        if OVERLAY_ENABLED:
+                            cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 255), 2)
+                            cv2.putText(frame, f"Unknown {dist_text}", (x, y-10),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                     else:
                         # Người quen (Xanh lá) - đã đăng ký
                         recognized_this_frame.add(label)
@@ -420,19 +436,22 @@ def main():
                         bar_height = 8
                         bar_y = y + h + 5
                         
-                        # Vẽ khung và progress
-                        cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
-                        cv2.rectangle(frame, (x, bar_y), (x + bar_width, bar_y + bar_height), (100, 100, 100), -1)
-                        cv2.rectangle(frame, (x, bar_y), (x + int(bar_width * progress), bar_y + bar_height), (0, 255, 0), -1)
+                        # Vẽ khung và progress (chỉ khi có GUI)
+                        if OVERLAY_ENABLED:
+                            cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                            cv2.rectangle(frame, (x, bar_y), (x + bar_width, bar_y + bar_height), (100, 100, 100), -1)
+                            cv2.rectangle(frame, (x, bar_y), (x + int(bar_width * progress), bar_y + bar_height), (0, 255, 0), -1)
                         
                         if remaining > 0:
                             # Đang đếm ngược
-                            cv2.putText(frame, f"{label} - Giu {remaining:.1f}s", (x, y-10),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                            if OVERLAY_ENABLED:
+                                cv2.putText(frame, f"{label} - Giu {remaining:.1f}s", (x, y-10),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                         else:
                             # Đủ thời gian giữ mặt -> Chấm công
-                            cv2.putText(frame, f"{label} {dist_text}", (x, y-10),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                            if OVERLAY_ENABLED:
+                                cv2.putText(frame, f"{label} {dist_text}", (x, y-10),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                             
                             # --- BƯỚC 4: Logic Chấm Công (Debounce) ---
                             if label not in last_checkin or (current_time - last_checkin[label] > COOLDOWN_SECONDS):
@@ -500,7 +519,13 @@ def main():
                     names = recognizer.get_registered_names()
                     if names:
                         for i, name in enumerate(names, 1):
-                            emb_count = len(recognizer.db[name]) if isinstance(recognizer.db[name], list) else 1
+                            emb_data = recognizer.db.get(name)
+                            if isinstance(emb_data, list):
+                                emb_count = len(emb_data)
+                            elif hasattr(emb_data, "shape"):
+                                emb_count = emb_data.shape[0]
+                            else:
+                                emb_count = 1
                             print(f"   {i}. {name} ({emb_count})")
                     else:
                         print("   (trống)")

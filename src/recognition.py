@@ -29,11 +29,39 @@ class FaceRecognizer:
         self.input_details = self.interpreter.get_input_details()
         self.output_details = self.interpreter.get_output_details()
         
-        input_shape = self.input_details[0]['shape']
+        raw_shape = self.input_details[0].get('shape', [])
+        input_shape = tuple(int(dim) for dim in raw_shape) if len(raw_shape) else (1, 112, 112, 3)
+        if len(input_shape) < 4:
+            raise ValueError(f"Unexpected input shape for recognition model: {input_shape}")
 
-        self.batch_size = input_shape[0]
-        self.input_height = input_shape[1]
-        self.input_width = input_shape[2]
+        if input_shape[0] <= 0:
+            # Model cho phép batch động, thu nhỏ xuống 1 để tiết kiệm tài nguyên
+            target_shape = list(input_shape)
+            target_shape[0] = 1
+            self.interpreter.resize_tensor_input(self.input_details[0]['index'], target_shape)
+            self.interpreter.allocate_tensors()
+            self.input_details = self.interpreter.get_input_details()
+            self.output_details = self.interpreter.get_output_details()
+            raw_shape = self.input_details[0].get('shape', target_shape)
+            input_shape = tuple(int(dim) for dim in raw_shape)
+
+        self.batch_size = max(1, int(input_shape[0]))
+        self.input_height = int(input_shape[1])
+        self.input_width = int(input_shape[2])
+        self._input_index = self.input_details[0]['index']
+        self._output_index = self.output_details[0]['index']
+        output_shape = self.output_details[0].get('shape')
+        if output_shape is None:
+            self._embedding_dim = 192
+        else:
+            if hasattr(output_shape, "tolist"):
+                shape_seq = output_shape.tolist()
+            else:
+                shape_seq = list(output_shape)
+            self._embedding_dim = int(shape_seq[-1]) if len(shape_seq) > 0 else 192
+
+        # Reuse buffers để tránh cấp phát liên tục trên Pi
+        self._input_buffer = np.zeros((self.batch_size, self.input_height, self.input_width, 3), dtype=np.float32)
         
         self.db_path = db_path
         
@@ -54,16 +82,28 @@ class FaceRecognizer:
     def _migrate_db_format(self):
         """Chuyển đổi database từ format cũ sang format mới nếu cần"""
         migrated = False
-        for label, data in self.db.items():
-            if isinstance(data, np.ndarray) and len(data.shape) == 1:
-                self.db[label] = [data]
+        for label, data in list(self.db.items()):
+            arr = np.asarray(data, dtype=np.float32)
+            if arr.ndim == 1:
+                arr = arr[np.newaxis, :]
+            elif arr.ndim > 2:
+                arr = arr.reshape(arr.shape[0], -1)
+            if not isinstance(data, np.ndarray) or arr.ndim != data.ndim or arr.dtype != getattr(data, "dtype", None):
+                self.db[label] = arr
                 migrated = True
         if migrated:
             self.save_db()
     
     def get_db_info(self):
         """Trả về thông tin database để hiển thị"""
-        total_embeddings = sum(len(embs) if isinstance(embs, list) else 1 for embs in self.db.values())
+        total_embeddings = 0
+        for embs in self.db.values():
+            if isinstance(embs, np.ndarray):
+                total_embeddings += embs.shape[0]
+            elif isinstance(embs, list):
+                total_embeddings += len(embs)
+            else:
+                total_embeddings += 1
         return len(self.db), total_embeddings
 
     def _preprocess_face(self, face_img):
@@ -96,19 +136,20 @@ class FaceRecognizer:
         """Trích xuất embedding từ ảnh khuôn mặt"""
         img = self._preprocess_face(face_img)
         
-        input_data = np.stack([img, img], axis=0)  # Shape: [2, 112, 112, 3]
+        # Gán ảnh vào buffer và nhân bản nếu model yêu cầu batch > 1
+        self._input_buffer[:] = img
         
-        self.interpreter.set_tensor(self.input_details[0]['index'], input_data)
+        self.interpreter.set_tensor(self._input_index, self._input_buffer)
         self.interpreter.invoke()
         
-        output = self.interpreter.get_tensor(self.output_details[0]['index'])
-        emb = output[0].astype(np.float32)
+        output = self.interpreter.get_tensor(self._output_index)
+        emb = np.array(output[0], dtype=np.float32, copy=True)
         
         # L2 normalize
         emb = emb / (np.linalg.norm(emb) + 1e-10)
         
         # Giải phóng bộ nhớ tạm
-        del img, input_data, output
+        del img, output
         
         return emb
 
@@ -128,26 +169,32 @@ class FaceRecognizer:
         person_scores = {}
         
         for label, embeddings in self.db.items():
-            if not isinstance(embeddings, list):
-                embeddings = [embeddings]
-            
-            # Tính tất cả distances
-            distances = [np.linalg.norm(db_emb - emb) for db_emb in embeddings]
-            
-            # Lấy average của top-3 (hoặc ít hơn nếu không đủ)
-            distances.sort()
-            top_k = min(3, len(distances))
-            avg_dist = sum(distances[:top_k]) / top_k
-            
-            # Bonus: Nếu có ít nhất 1 match rất gần (<0.3), giảm distance
-            min_dist = distances[0]
-            if min_dist < 0.3:
-                avg_dist = avg_dist * 0.8  # Boost 20%
+            embeddings_arr = np.asarray(embeddings, dtype=np.float32)
+            if embeddings_arr.ndim == 1:
+                embeddings_arr = embeddings_arr[np.newaxis, :]
+            if embeddings_arr.size == 0:
+                continue
+
+            distances = np.linalg.norm(embeddings_arr - emb, axis=1)
+
+            top_k = min(3, distances.shape[0])
+            if top_k > 0:
+                if distances.shape[0] > top_k:
+                    top_values = np.partition(distances, top_k - 1)[:top_k]
+                else:
+                    top_values = distances
+                avg_dist = float(np.mean(top_values))
+            else:
+                avg_dist = float('inf')
+
+            min_dist = float(np.min(distances)) if distances.size else float('inf')
+            if min_dist < 0.3 and avg_dist < float('inf'):
+                avg_dist *= 0.8  # Boost 20%
             
             person_scores[label] = {
                 'avg_dist': avg_dist,
                 'min_dist': min_dist,
-                'matches': len([d for d in distances if d < threshold])
+                'matches': int(np.count_nonzero(distances < threshold))
             }
         
         # Kiểm tra nếu không có kết quả
@@ -175,22 +222,32 @@ class FaceRecognizer:
         
         results = []
         for label, embeddings in self.db.items():
-            if not isinstance(embeddings, list):
-                embeddings = [embeddings]
-            
-            distances = sorted([np.linalg.norm(db_emb - emb) for db_emb in embeddings])
-            top_k = min(3, len(distances))
-            avg_dist = sum(distances[:top_k]) / top_k
-            
+            embeddings_arr = np.asarray(embeddings, dtype=np.float32)
+            if embeddings_arr.ndim == 1:
+                embeddings_arr = embeddings_arr[np.newaxis, :]
+            if embeddings_arr.size == 0:
+                continue
+
+            distances = np.linalg.norm(embeddings_arr - emb, axis=1)
+            if distances.size == 0:
+                continue
+
+            top_k = min(3, distances.shape[0])
+            if distances.shape[0] > top_k:
+                top_values = np.partition(distances, top_k - 1)[:top_k]
+            else:
+                top_values = distances
+            avg_dist = float(np.mean(top_values))
+
             # Convert distance to confidence (0-100%)
             # distance 0 -> 100%, distance >= threshold -> 0%
-            confidence = max(0, (threshold - avg_dist) / threshold) * 100
+            confidence = max(0.0, (threshold - avg_dist) / threshold) * 100
             
             results.append({
                 'label': label,
                 'confidence': confidence,
                 'avg_dist': avg_dist,
-                'min_dist': distances[0]
+                'min_dist': float(np.min(distances))
             })
         
         results.sort(key=lambda x: x['confidence'], reverse=True)
@@ -202,13 +259,15 @@ class FaceRecognizer:
     def add_face(self, label, face_img):
         """Thêm embedding mới cho người (không ghi đè, thêm vào list)"""
         emb = self.get_embedding(face_img)
+        emb = emb[np.newaxis, :]
         
         if label in self.db:
-            if not isinstance(self.db[label], list):
-                self.db[label] = [self.db[label]]
-            self.db[label].append(emb)
+            existing = np.asarray(self.db[label], dtype=np.float32)
+            if existing.ndim == 1:
+                existing = existing[np.newaxis, :]
+            self.db[label] = np.concatenate((existing, emb), axis=0)
         else:
-            self.db[label] = [emb]
+            self.db[label] = emb
 
     def remove_face(self, label):
         """Xóa người khỏi database"""

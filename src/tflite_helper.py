@@ -9,7 +9,31 @@ import platform
 
 # Detect platform để tối ưu số threads
 IS_PI = platform.system() == "Linux" and os.path.exists("/proc/device-tree/model")
-NUM_THREADS = 4 if IS_PI else 2  # Pi 3 có 4 cores
+
+try:
+    from .config import CONFIG as _CONFIG
+except ImportError:
+    try:
+        from config import CONFIG as _CONFIG
+    except ImportError:
+        _CONFIG = None
+
+def _resolve_thread_count():
+    default_threads = 2 if IS_PI else 4
+    if _CONFIG is None:
+        return default_threads
+
+    configured = _CONFIG.get('TFLITE_NUM_THREADS')
+    if configured is None:
+        return default_threads
+
+    try:
+        value = int(configured)
+        return max(1, value)
+    except (TypeError, ValueError):
+        return default_threads
+
+NUM_THREADS = _resolve_thread_count()
 
 # Cache để tránh print nhiều lần
 _logged_runtime = False
