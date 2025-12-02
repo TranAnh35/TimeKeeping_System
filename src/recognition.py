@@ -9,25 +9,36 @@ import platform as _platform
 # Support both direct script execution and module import
 try:
     from .tflite_helper import get_interpreter
+    from .config import CONFIG
 except ImportError:
     from tflite_helper import get_interpreter
+    from config import CONFIG
 
 # Detect platform
 _IS_PI = _platform.system() == "Linux" and os.path.exists("/proc/device-tree/model")
 
+# Lấy model path từ config (hỗ trợ INT8 hoặc Float32)
+_DEFAULT_MODEL_PATH = CONFIG.get('RECOGNITION_MODEL', "models/recognition/MobileFaceNet.tflite")
+
 class FaceRecognizer:
-    def __init__(self, model_path="models/recognition/MobileFaceNet.tflite", db_path="face_db.pkl", 
+    def __init__(self, model_path=None, db_path="face_db.pkl", 
                  enable_histogram_eq=None):
         """
         Args:
-            model_path: Đường dẫn model TFLite
+            model_path: Đường dẫn model TFLite (None = lấy từ config)
             db_path: Đường dẫn database embeddings
             enable_histogram_eq: Bật histogram equalization (None=auto: tắt trên Pi để tiết kiệm CPU)
         """
+        if model_path is None:
+            model_path = _DEFAULT_MODEL_PATH
+            
         self.interpreter = get_interpreter(model_path)
         self.interpreter.allocate_tensors()
         self.input_details = self.interpreter.get_input_details()
         self.output_details = self.interpreter.get_output_details()
+        
+        # Xác định input dtype (INT8 hoặc Float32)
+        self._input_dtype = self.input_details[0]['dtype']
         
         raw_shape = self.input_details[0].get('shape', [])
         input_shape = tuple(int(dim) for dim in raw_shape) if len(raw_shape) else (1, 112, 112, 3)
@@ -60,8 +71,9 @@ class FaceRecognizer:
                 shape_seq = list(output_shape)
             self._embedding_dim = int(shape_seq[-1]) if len(shape_seq) > 0 else 192
 
-        # Reuse buffers để tránh cấp phát liên tục trên Pi
-        self._input_buffer = np.zeros((self.batch_size, self.input_height, self.input_width, 3), dtype=np.float32)
+        # Reuse buffers - dtype phụ thuộc vào model
+        buffer_dtype = np.int8 if self._input_dtype == np.int8 else np.float32
+        self._input_buffer = np.zeros((self.batch_size, self.input_height, self.input_width, 3), dtype=buffer_dtype)
         
         self.db_path = db_path
         
@@ -111,7 +123,7 @@ class FaceRecognizer:
         Preprocess face với các bước cải thiện chất lượng:
         1. Resize về kích thước model
         2. Histogram equalization để cân bằng ánh sáng (optional, tắt trên Pi)
-        3. Normalize theo chuẩn MobileFaceNet [-1, 1]
+        3. Normalize theo chuẩn model (INT8 hoặc Float32)
         """
         # Resize
         img = cv2.resize(face_img, (self.input_width, self.input_height))
@@ -126,9 +138,14 @@ class FaceRecognizer:
             img_yuv[:,:,0] = cv2.equalizeHist(img_yuv[:,:,0])
             img = cv2.cvtColor(img_yuv, cv2.COLOR_YUV2RGB)
         
-        # Normalize to [-1, 1] (chuẩn MobileFaceNet)
-        img = img.astype(np.float32)
-        img = (img - 127.5) / 127.5
+        # Normalize theo dtype của model
+        if self._input_dtype == np.int8:
+            # INT8: scale về [-128, 127]
+            img = (img.astype(np.float32) - 127.5).astype(np.int8)
+        else:
+            # Float32: normalize về [-1, 1] (chuẩn MobileFaceNet)
+            img = img.astype(np.float32)
+            img = (img - 127.5) / 127.5
         
         return img
 

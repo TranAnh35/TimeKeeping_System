@@ -101,6 +101,12 @@ MIN_FRAME_SKIP = int(CONFIG.get('MIN_FRAME_SKIP', 1))
 MAX_FRAME_SKIP = int(CONFIG.get('MAX_FRAME_SKIP', 5))
 DEFAULT_FRAME_SKIP = int(CONFIG.get('DEFAULT_FRAME_SKIP', 2 if IS_PI else 1))
 
+# --- CENTER ROI ---
+# Chỉ nhận diện khi mặt nằm trong vùng trung tâm màn hình
+# Giúp người dùng nhìn thẳng vào camera -> embedding chuẩn hơn -> nhận diện ổn định hơn
+ENABLE_CENTER_ROI = bool(CONFIG.get('ENABLE_CENTER_ROI', True))
+CENTER_ROI_RATIO = float(CONFIG.get('CENTER_ROI_RATIO', 0.6))  # 60% chiều rộng màn hình
+
 
 class AdaptiveFrameSkip:
     """
@@ -289,6 +295,10 @@ def main():
     if sync_result['added'] or sync_result['removed']:
         print(f"🔄 Sync: +{sync_result['added']} -{sync_result['removed']}")
     
+    # Hiển thị model type (INT8 hoặc Float32)
+    use_int8 = CONFIG.get('USE_INT8_MODELS', False)
+    print(f"🧠 Models: {'INT8 (optimized)' if use_int8 else 'Float32'}")
+    
     if LOW_MEMORY_MODE:
         print(f"💾 Low-RAM: {CAMERA_WIDTH}x{CAMERA_HEIGHT}")
     
@@ -296,6 +306,9 @@ def main():
         print(f"⚡ Adaptive Skip: ON (target={int(TARGET_PROCESS_TIME*1000)}ms, range={MIN_FRAME_SKIP}-{MAX_FRAME_SKIP})")
     else:
         print(f"⚡ Frame Skip: {DEFAULT_FRAME_SKIP} (fixed)")
+    
+    if ENABLE_CENTER_ROI:
+        print(f"🎯 Center ROI: ON ({int(CENTER_ROI_RATIO*100)}% màn hình)")
     
     if ENABLE_MIDNIGHT_CHECKOUT:
         print(f"⏰ Auto Checkout: ON (00:00 mỗi ngày)")
@@ -344,9 +357,9 @@ def main():
         camera_fps = captured_frame_count / elapsed
         pipeline_fps = processed_frame_count / elapsed
         skip_value = adaptive_skip.current_skip if ENABLE_ADAPTIVE_SKIP and adaptive_skip else DEFAULT_FRAME_SKIP
-        logger.info(
-            f"📹 FPS camera≈{camera_fps:.2f} | pipeline≈{pipeline_fps:.2f} | faces:{faces_in_frame} | skip:{skip_value}"
-        )
+        # logger.info(
+        #     f"📹 FPS camera≈{camera_fps:.2f} | pipeline≈{pipeline_fps:.2f} | faces:{faces_in_frame} | skip:{skip_value}"
+        # )
         fps_window_start = now
         captured_frame_count = 0
         processed_frame_count = 0
@@ -407,6 +420,20 @@ def main():
             # Danh sách người được nhận diện trong frame này
             recognized_this_frame = set()
             processed_frame_count += 1
+            
+            # Tính vùng Center ROI (chỉ tính 1 lần per frame)
+            frame_h, frame_w = frame.shape[:2]
+            if ENABLE_CENTER_ROI:
+                roi_margin = (1 - CENTER_ROI_RATIO) / 2
+                roi_x_min = int(frame_w * roi_margin)
+                roi_x_max = int(frame_w * (1 - roi_margin))
+                roi_y_min = int(frame_h * roi_margin)
+                roi_y_max = int(frame_h * (1 - roi_margin))
+                
+                # Vẽ khung ROI để hướng dẫn người dùng (chỉ khi có GUI)
+                if OVERLAY_ENABLED:
+                    cv2.rectangle(frame, (roi_x_min, roi_y_min), (roi_x_max, roi_y_max), 
+                                  (200, 200, 200), 1)
 
             for det in detections:
                 x, y, w, h = det['box']
@@ -414,9 +441,28 @@ def main():
                 # Validate kích thước: Mặt quá nhỏ (<60px) thì bỏ qua để đỡ tốn CPU detect anti-spoof
                 if w < 60 or h < 60:
                     continue
+                
+                # --- CENTER ROI CHECK ---
+                # Kiểm tra xem tâm khuôn mặt có nằm trong vùng trung tâm không
+                face_center_x = x + w // 2
+                face_center_y = y + h // 2
+                
+                if ENABLE_CENTER_ROI:
+                    is_in_center = (roi_x_min <= face_center_x <= roi_x_max and 
+                                    roi_y_min <= face_center_y <= roi_y_max)
+                else:
+                    is_in_center = True  # Không giới hạn nếu tắt Center ROI
 
                 face = frame[y:y+h, x:x+w]
                 if face.size == 0: continue
+                
+                # Nếu mặt nằm ngoài vùng trung tâm, chỉ hiển thị hướng dẫn, không nhận diện
+                if not is_in_center:
+                    if OVERLAY_ENABLED:
+                        cv2.rectangle(frame, (x, y), (x+w, y+h), (128, 128, 128), 1)  # Màu xám
+                        cv2.putText(frame, "Di chuyen vao giua", (x, y-10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (128, 128, 128), 1)
+                    continue  # Bỏ qua, không chạy recognition
 
                 # --- BƯỚC 1: Anti-Spoofing (có thể tắt để test) ---
                 if ENABLE_ANTISPOOF and anti is not None:

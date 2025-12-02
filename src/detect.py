@@ -8,22 +8,30 @@ from math import ceil
 # Support both direct script execution and module import
 try:
     from .tflite_helper import get_interpreter
+    from .config import CONFIG
 except ImportError:
     from tflite_helper import get_interpreter
+    from config import CONFIG
 
 # --- CẤU HÌNH ---
-MODEL_PATH = "models/detection/version-RFB-320_without_postprocessing.tflite"
+# Lấy model path từ config (hỗ trợ INT8 hoặc Float32)
+MODEL_PATH = CONFIG.get('DETECTION_MODEL', "models/detection/version-RFB-320_without_postprocessing.tflite")
 
 class UltraLightFaceDetector:
     def __init__(self, model_path=MODEL_PATH, conf_threshold=0.6):
         self.conf_threshold = conf_threshold
         self._priors_cache = None  # Cache priors để tránh tính lại mỗi frame
+        self._input_dtype = np.float32  # Default, sẽ cập nhật sau khi load model
         try:
             self.interpreter = get_interpreter(model_path)
             self.interpreter.allocate_tensors()
             self.input_details = self.interpreter.get_input_details()
             self.output_details = self.interpreter.get_output_details()
             self.input_shape = (320, 240)
+            
+            # Xác định input dtype (INT8 hoặc Float32)
+            self._input_dtype = self.input_details[0]['dtype']
+            
             # Pre-generate priors một lần duy nhất
             self._priors_cache = self._generate_priors(self.input_shape)
         except Exception as e:
@@ -36,10 +44,18 @@ class UltraLightFaceDetector:
 
         h_img, w_img, _ = frame.shape
         
-        # 1. Preprocess - dùng float32 để tiết kiệm RAM
+        # 1. Preprocess - hỗ trợ cả INT8 và Float32
         img_resized = cv2.resize(frame, self.input_shape) 
         img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
-        img_norm = ((img_rgb.astype(np.float32) - 127.0) / 128.0)
+        
+        # Xử lý theo dtype của model (INT8 hoặc Float32)
+        if self._input_dtype == np.int8:
+            # INT8: scale về [-128, 127]
+            img_norm = (img_rgb.astype(np.float32) - 127.0).astype(np.int8)
+        else:
+            # Float32: normalize về [-1, 1]
+            img_norm = ((img_rgb.astype(np.float32) - 127.0) / 128.0)
+        
         img_input = np.expand_dims(img_norm, axis=0)
 
         # 2. Inference
@@ -49,6 +65,10 @@ class UltraLightFaceDetector:
         # 3. Get Output
         out_a = self.interpreter.get_tensor(self.output_details[0]['index'])[0]
         out_b = self.interpreter.get_tensor(self.output_details[1]['index'])[0]
+        
+        # Convert output về float32 nếu cần (để tính toán chính xác)
+        out_a = out_a.astype(np.float32)
+        out_b = out_b.astype(np.float32)
         
         # Giải phóng bộ nhớ tạm
         del img_resized, img_rgb, img_norm, img_input

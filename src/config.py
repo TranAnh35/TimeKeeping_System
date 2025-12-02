@@ -32,7 +32,14 @@ DEFAULTS = {
     "MIN_FRAME_SKIP": 1,
     "MAX_FRAME_SKIP": 5,
     "DEFAULT_FRAME_SKIP": None,
-    "TFLITE_NUM_THREADS": None
+    "TFLITE_NUM_THREADS": None,
+    # Center ROI: Chỉ nhận diện khi mặt nằm trong vùng trung tâm
+    "ENABLE_CENTER_ROI": True,
+    "CENTER_ROI_RATIO": 0.6,  # Tỉ lệ vùng trung tâm (0.6 = 60% chiều rộng màn hình)
+    # Model paths - sử dụng INT8 mặc định trên Pi để tăng tốc
+    "USE_INT8_MODELS": None,  # None = auto (True trên Pi, False trên Windows)
+    "DETECTION_MODEL": None,   # None = tự chọn dựa trên USE_INT8_MODELS
+    "RECOGNITION_MODEL": None  # None = tự chọn dựa trên USE_INT8_MODELS
 }
 
 def _load_config(path):
@@ -71,6 +78,23 @@ if CONFIG['CAMERA_WIDTH'] is None or CONFIG['CAMERA_HEIGHT'] is None:
 
 if CONFIG['TFLITE_NUM_THREADS'] is None:
     CONFIG['TFLITE_NUM_THREADS'] = 2 if IS_PI else 4
+
+# INT8 models: auto-enable on Pi for better performance
+if CONFIG['USE_INT8_MODELS'] is None:
+    CONFIG['USE_INT8_MODELS'] = IS_PI
+
+# Set model paths based on INT8 preference
+if CONFIG['DETECTION_MODEL'] is None:
+    if CONFIG['USE_INT8_MODELS']:
+        CONFIG['DETECTION_MODEL'] = "models/detection/version-RFB-320_int8.tflite"
+    else:
+        CONFIG['DETECTION_MODEL'] = "models/detection/version-RFB-320_without_postprocessing.tflite"
+
+if CONFIG['RECOGNITION_MODEL'] is None:
+    if CONFIG['USE_INT8_MODELS']:
+        CONFIG['RECOGNITION_MODEL'] = "models/recognition/MobileFaceNet_int8.tflite"
+    else:
+        CONFIG['RECOGNITION_MODEL'] = "models/recognition/MobileFaceNet.tflite"
 
 def get(key, default=None):
     return CONFIG.get(key, default)
