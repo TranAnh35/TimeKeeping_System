@@ -1,22 +1,62 @@
 # src/main.py
-import os
+"""
+TimeKeeping System - Main Entry Point.
 
+Đây là file điều phối chính của hệ thống chấm công.
+Logic đã được tách ra các module riêng biệt:
+- core/: Infrastructure (settings, camera, tflite)
+- processing/: Frame processing (display, attendance, frame_skip)
+- detect/: Face detection
+- recognition/: Face recognition
+
+File này chỉ đảm nhiệm việc kết nối các module lại với nhau.
+
+Usage:
+    python -m src.main                    # Auto-detect model type
+    python -m src.main --int8             # Force INT8 models
+    python -m src.main --float32          # Force Float32 models
+    python -m src.main --threshold 0.6    # Custom recognition threshold
+    python -m src.main --no-web           # Disable web server
+"""
+import os
+import sys
+import gc
+import time
+import datetime
+import threading
+import logging
+import argparse
+
+# === SETUP DISPLAY TRƯỚC KHI IMPORT CV2 ===
 if os.environ.get("DISPLAY", "") == "":
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import cv2
-import time
-import datetime
-import gc
-import sys
-import platform
-import threading
-import logging
 
-# --- CẤU HÌNH LOGGING ---
-# Log ra file trên Pi để debug từ xa
-IS_WINDOWS_EARLY = platform.system() == "Windows"
-if not IS_WINDOWS_EARLY:
+# === IMPORTS ===
+try:
+    from .core import settings, CameraManager, CameraConfig
+    from .core.model_factory import create_detector, create_recognizer
+    from .processing import create_frame_skip, DisplayHandler, FaceStatus
+    from .processing import AttendanceTracker, AttendanceAction
+    from .data.database import (
+        log_attendance, add_employee, remove_employee,
+        sync_employees_with_face_db, init_db,
+        midnight_checkout_all_sessions
+    )
+except ImportError:
+    from core import settings, CameraManager, CameraConfig
+    from core.model_factory import create_detector, create_recognizer
+    from processing import create_frame_skip, DisplayHandler, FaceStatus
+    from processing import AttendanceTracker, AttendanceAction
+    from data.database import (
+        log_attendance, add_employee, remove_employee,
+        sync_employees_with_face_db, init_db,
+        midnight_checkout_all_sessions
+    )
+
+# === LOGGING SETUP ===
+if settings.IS_PI:
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
@@ -33,290 +73,210 @@ else:
 
 logger = logging.getLogger(__name__)
 
-# Support both direct script execution and module import
-try:
-    from .detect import detect_faces
-    from .recognition import FaceRecognizer
-    from .database import (log_attendance, add_employee, remove_employee, 
-                           sync_employees_with_face_db, init_db,
-                           midnight_checkout_all_sessions)
-    from .config import CONFIG
-except ImportError:
-    from detect import detect_faces
-    from recognition import FaceRecognizer
-    from database import (log_attendance, add_employee, remove_employee, 
-                          sync_employees_with_face_db, init_db,
-                          midnight_checkout_all_sessions)
-    from config import CONFIG
-
-# --- TỰ ĐỘNG PHÁT HIỆN PLATFORM ---
-IS_WINDOWS = platform.system() == "Windows"
-IS_PI = platform.system() == "Linux" and os.path.exists("/proc/device-tree/model")
-
-if IS_PI:
+# === OPENCV THREADING ===
+if settings.IS_PI:
     try:
         cv2.setNumThreads(1)
     except Exception:
         pass
 
-# --- CẤU HÌNH ---
-# Các giá trị mặc định được lấy từ 'config/config.json' qua module `src/config.py` (CONFIG dict)
-COOLDOWN_SECONDS = int(CONFIG.get('COOLDOWN_SECONDS', 300))  # seconds
-HOLD_TIME_SECONDS = float(CONFIG.get('HOLD_TIME_SECONDS', 1.5))  # seconds
-ENABLE_WEB_SERVER = bool(CONFIG.get('ENABLE_WEB_SERVER', True))
-WEB_PORT = int(CONFIG.get('WEB_PORT', 5000))
-ENABLE_ANTISPOOF = bool(CONFIG.get('ENABLE_ANTISPOOF', False))
 
-# Threshold cho recognition:
-RECOGNITION_THRESHOLD = float(CONFIG.get('RECOGNITION_THRESHOLD', 0.55))
-
-# --- CHẾ ĐỘ HIỂN THỊ (GUI) ---
-# FORCE_GUI_MODE: Bật này để hiển thị cửa sổ camera trên Pi (kết nối màn hình HDMI)
-FORCE_GUI_MODE = bool(CONFIG.get('FORCE_GUI_MODE', False))  # Đặt True khi muốn debug trên Pi với màn hình
-
-# Chế độ hoạt động: Windows luôn có GUI, Pi mặc định headless (trừ khi FORCE_GUI)
-HEADLESS_MODE = not IS_WINDOWS and not FORCE_GUI_MODE
-OVERLAY_ENABLED = not HEADLESS_MODE
-
-# --- CẤU HÌNH AUTO CHECK-OUT LÚC NỬA ĐÊM ---
-# Tự động check-out tất cả sessions đang mở vào lúc 00:00 mỗi ngày
-ENABLE_MIDNIGHT_CHECKOUT = bool(CONFIG.get('ENABLE_MIDNIGHT_CHECKOUT', True))
-
-# --- CẤU HÌNH TỐI ƯU RAM (cho Pi 3) ---
-LOW_MEMORY_MODE = bool(CONFIG.get('LOW_MEMORY_MODE', IS_PI))  # Tự động bật trên Pi (có thể override từ file config)
-CAMERA_WIDTH = int(CONFIG.get('CAMERA_WIDTH', 640 if not LOW_MEMORY_MODE else 320))
-CAMERA_HEIGHT = int(CONFIG.get('CAMERA_HEIGHT', 480 if not LOW_MEMORY_MODE else 240))
-GC_INTERVAL = int(CONFIG.get('GC_INTERVAL', 900))
-if GC_INTERVAL < 0:
-    GC_INTERVAL = 0
-if IS_PI and 0 < GC_INTERVAL < 600:
-    logger.debug("Điều chỉnh GC_INTERVAL lên 600 frames để giảm nghẽn trên Pi")
-    GC_INTERVAL = 600
-
-# --- ADAPTIVE FRAME SKIP ---
-# Tự động điều chỉnh số frame bỏ qua dựa trên tải CPU
-ENABLE_ADAPTIVE_SKIP = bool(CONFIG.get('ENABLE_ADAPTIVE_SKIP', IS_PI))  # Chỉ bật trên Pi
-TARGET_PROCESS_TIME = float(CONFIG.get('TARGET_PROCESS_TIME', 0.15))  # Mục tiêu: xử lý mỗi frame trong 150ms
-MIN_FRAME_SKIP = int(CONFIG.get('MIN_FRAME_SKIP', 1))
-MAX_FRAME_SKIP = int(CONFIG.get('MAX_FRAME_SKIP', 5))
-DEFAULT_FRAME_SKIP = int(CONFIG.get('DEFAULT_FRAME_SKIP', 2 if IS_PI else 1))
-
-# --- CENTER ROI ---
-# Chỉ nhận diện khi mặt nằm trong vùng trung tâm màn hình
-# Giúp người dùng nhìn thẳng vào camera -> embedding chuẩn hơn -> nhận diện ổn định hơn
-ENABLE_CENTER_ROI = bool(CONFIG.get('ENABLE_CENTER_ROI', True))
-CENTER_ROI_RATIO = float(CONFIG.get('CENTER_ROI_RATIO', 0.6))  # 60% chiều rộng màn hình
-
-
-class AdaptiveFrameSkip:
-    """
-    Tự động điều chỉnh frame skip dựa trên thời gian xử lý thực tế.
-    - CPU nhàn rỗi → giảm skip (xử lý nhiều frame hơn, mượt hơn)
-    - CPU quá tải → tăng skip (giảm tải, tránh lag)
-    """
-    def __init__(self, target_time=TARGET_PROCESS_TIME, 
-                 min_skip=MIN_FRAME_SKIP, max_skip=MAX_FRAME_SKIP,
-                 initial_skip=DEFAULT_FRAME_SKIP):
-        self.target_time = target_time
-        self.min_skip = min_skip
-        self.max_skip = max_skip
-        self.current_skip = initial_skip
-        
-        # Smoothing: dùng moving average để tránh dao động
-        self.time_history = []
-        self.history_size = 5
-        
-        # Stats
-        self.total_frames = 0
-        self.processed_frames = 0
-        self.last_adjust_time = time.time()
-        self.adjust_interval = 2.0  # Điều chỉnh mỗi 2 giây
+def parse_arguments():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description='TimeKeeping System - Face Recognition Attendance',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python -m src.main                    # Run with defaults
+  python -m src.main --threshold 0.6    # Custom threshold
+  python -m src.main --no-web --headless
+        """
+    )
     
-    def update(self, process_time):
-        """
-        Cập nhật thời gian xử lý và điều chỉnh skip rate.
-        
-        Args:
-            process_time: Thời gian xử lý frame vừa rồi (giây)
-        """
-        self.time_history.append(process_time)
-        if len(self.time_history) > self.history_size:
-            self.time_history.pop(0)
-        
-        self.processed_frames += 1
-        
-        # Chỉ điều chỉnh mỗi adjust_interval giây
-        current_time = time.time()
-        if current_time - self.last_adjust_time < self.adjust_interval:
-            return self.current_skip
-        
-        self.last_adjust_time = current_time
-        
-        # Tính trung bình thời gian xử lý
-        avg_time = sum(self.time_history) / len(self.time_history)
-        
-        old_skip = self.current_skip
-        
-        # Điều chỉnh skip dựa trên tỉ lệ với target
-        if avg_time < self.target_time * 0.5:
-            # CPU rất nhàn rỗi (<75ms) → giảm skip nhiều
-            self.current_skip = max(self.min_skip, self.current_skip - 1)
-        elif avg_time < self.target_time * 0.8:
-            # CPU nhàn rỗi (<120ms) → giảm skip nhẹ
-            if self.current_skip > self.min_skip:
-                self.current_skip -= 1
-        elif avg_time > self.target_time * 1.5:
-            # CPU quá tải (>225ms) → tăng skip nhiều
-            self.current_skip = min(self.max_skip, self.current_skip + 2)
-        elif avg_time > self.target_time * 1.2:
-            # CPU hơi cao (>180ms) → tăng skip nhẹ
-            self.current_skip = min(self.max_skip, self.current_skip + 1)
-        
-        # Log khi thay đổi
-        if old_skip != self.current_skip:
-            logger.debug(f"Adaptive skip: {old_skip} → {self.current_skip} (avg={avg_time*1000:.0f}ms)")
-        
-        return self.current_skip
+    # Recognition settings
+    parser.add_argument(
+        '--threshold', '-t',
+        type=float,
+        metavar='VALUE',
+        help=f'Recognition threshold (default: {settings.RECOGNITION_THRESHOLD})'
+    )
     
-    def should_process(self, frame_count):
-        """
-        Kiểm tra frame này có nên xử lý không.
-        
-        Returns:
-            True nếu nên xử lý frame này
-        """
-        self.total_frames += 1
-        return frame_count % self.current_skip == 0
+    # Web server
+    parser.add_argument(
+        '--no-web',
+        action='store_true',
+        help='Disable web server'
+    )
+    parser.add_argument(
+        '--port', '-p',
+        type=int,
+        metavar='PORT',
+        help=f'Web server port (default: {settings.WEB_PORT})'
+    )
     
-    def get_stats(self):
-        """Lấy thống kê hiệu suất"""
-        if self.total_frames == 0:
-            return "No stats yet"
-        
-        avg_time = sum(self.time_history) / len(self.time_history) if self.time_history else 0
-        skip_rate = (self.total_frames - self.processed_frames) / self.total_frames * 100
-        
-        return {
-            'current_skip': self.current_skip,
-            'avg_process_ms': avg_time * 1000,
-            'skip_rate_percent': skip_rate,
-            'effective_fps': self.processed_frames / max(1, self.total_frames) * 15  # Giả sử camera 15fps
-        }
+    # Display mode
+    parser.add_argument(
+        '--headless',
+        action='store_true',
+        help='Run in headless mode (no GUI)'
+    )
+    parser.add_argument(
+        '--gui',
+        action='store_true', 
+        help='Force GUI mode (even on Pi)'
+    )
+    
+    # Camera settings
+    parser.add_argument(
+        '--camera', '-c',
+        type=int,
+        default=0,
+        metavar='ID',
+        help='Camera device ID (default: 0)'
+    )
+    parser.add_argument(
+        '--resolution', '-r',
+        type=str,
+        metavar='WxH',
+        help=f'Camera resolution (default: {settings.CAMERA_WIDTH}x{settings.CAMERA_HEIGHT})'
+    )
+    
+    # Timing
+    parser.add_argument(
+        '--cooldown',
+        type=int,
+        metavar='SECONDS',
+        help=f'Cooldown between check-ins (default: {settings.COOLDOWN_SECONDS}s)'
+    )
+    parser.add_argument(
+        '--hold-time',
+        type=float,
+        metavar='SECONDS',
+        help=f'Face hold time to confirm (default: {settings.HOLD_TIME_SECONDS}s)'
+    )
+    
+    # Debug
+    parser.add_argument(
+        '--verbose', '-v',
+        action='store_true',
+        help='Verbose logging'
+    )
+    
+    return parser.parse_args()
 
-def start_web_server():
-    """Chạy web server trong thread riêng"""
+
+def apply_arguments(args):
+    """Apply command line arguments to settings."""
+    changes = []
+    
+    # Recognition threshold
+    if args.threshold is not None:
+        settings.RECOGNITION_THRESHOLD = args.threshold
+        changes.append(f"Threshold: {args.threshold}")
+    
+    # Web server
+    if args.no_web:
+        settings.ENABLE_WEB_SERVER = False
+        changes.append("Web: disabled")
+    if args.port:
+        settings.WEB_PORT = args.port
+        changes.append(f"Port: {args.port}")
+    
+    # Display mode
+    if args.headless:
+        settings.HEADLESS_MODE = True
+        settings.OVERLAY_ENABLED = False
+        changes.append("Mode: headless")
+    if args.gui:
+        settings.FORCE_GUI_MODE = True
+        settings.HEADLESS_MODE = False
+        settings.OVERLAY_ENABLED = True
+        changes.append("Mode: GUI (forced)")
+    
+    # Camera resolution
+    if args.resolution:
+        try:
+            w, h = map(int, args.resolution.lower().split('x'))
+            settings.CAMERA_WIDTH = w
+            settings.CAMERA_HEIGHT = h
+            changes.append(f"Resolution: {w}x{h}")
+        except ValueError:
+            print(f"⚠️ Invalid resolution format: {args.resolution} (use WxH, e.g., 640x480)")
+    
+    # Timing
+    if args.cooldown:
+        settings.COOLDOWN_SECONDS = args.cooldown
+        changes.append(f"Cooldown: {args.cooldown}s")
+    if args.hold_time:
+        settings.HOLD_TIME_SECONDS = args.hold_time
+        changes.append(f"Hold time: {args.hold_time}s")
+    
+    # Verbose logging
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+        changes.append("Verbose: ON")
+    
+    return changes
+
+
+def start_web_server(detector=None, recognizer=None):
+    """Chạy web server trong thread riêng."""
     try:
-        from web_server import run_server
-        run_server(host='0.0.0.0', port=WEB_PORT)
-    except Exception:
-        pass  # Lỗi web server không ảnh hưởng chấm công chính
-
-def init_camera(max_retries=3, retry_delay=2):
-    """Khởi tạo camera với retry logic"""
-    for attempt in range(max_retries):
-        cap = cv2.VideoCapture(0)
-        if cap.isOpened():
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            # Thêm cấu hình cho Pi camera
-            if IS_PI:
-                cap.set(cv2.CAP_PROP_FPS, 15)  # Giảm FPS để ổn định
-                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-            # Warm-up camera - đọc vài frame đầu để ổn định
-            for _ in range(5):
-                cap.grab()
-            return cap
+        try:
+            from .web.server import run_server, setup_management
+        except ImportError:
+            from web.server import run_server, setup_management
         
-        print(f"⚠️ Camera không sẵn sàng, thử lại ({attempt + 1}/{max_retries})...")
-        time.sleep(retry_delay)
-    
-    return None
-
-def main():
-    # 0. Khởi tạo Database
-    init_db()
-    
-    # 0.1 Khởi động Web Server (chạy nền)
-    if ENABLE_WEB_SERVER:
-        web_thread = threading.Thread(target=start_web_server, daemon=True)
-        web_thread.start()
-    
-    # 1. Khởi tạo Camera với retry
-    cap = init_camera()
-    if cap is None:
-        print("❌ Không thể kết nối camera sau nhiều lần thử!")
-        return
-
-    try:
-        # Lazy loading: Chỉ load AntiSpoof nếu cần
-        anti = None
-        if ENABLE_ANTISPOOF:
-            try:
-                from .antispoof import AntiSpoof
-            except ImportError:
-                from antispoof import AntiSpoof
-            anti = AntiSpoof()
+        # Setup management module với detector và recognizer
+        if detector is not None and recognizer is not None:
+            setup_management(detector, recognizer)
+            logger.info("Web Management đã được kích hoạt: /manage")
         
-        recognizer = FaceRecognizer()
-        
-        # Đồng bộ SQLite employees với face_db.pkl
-        sync_result = sync_employees_with_face_db(recognizer.get_registered_names())
-        
-        # Garbage collect sau khi load xong models
-        gc.collect()
-        
+        run_server(host='0.0.0.0', port=settings.WEB_PORT)
     except Exception as e:
-        logger.error(f"Lỗi khởi tạo: {e}")
-        return
+        logger.error(f"Web server error: {e}")
+        import traceback
+        traceback.print_exc()
 
-    # Dictionary lưu thời gian chấm công gần nhất
-    last_checkin = {} 
-    face_hold_tracker = {}
 
-    # --- LOG KHỞI ĐỘNG GỌN GÀNG ---
-    print("\n" + "="*50)
+def print_startup_info(recognizer, sync_result: dict):
+    """In thông tin khởi động."""
+    print("\n" + "=" * 50)
     print("🕐 HỆ THỐNG CHẤM CÔNG")
-    print("="*50)
+    print("=" * 50)
     
-    # Hiển thị mode chi tiết hơn
-    if IS_WINDOWS:
+    # Platform mode
+    if settings.IS_WINDOWS:
         mode = "Windows (GUI)"
-    elif FORCE_GUI_MODE:
+    elif settings.FORCE_GUI_MODE:
         mode = "Pi (GUI - debug mode)"
     else:
         mode = "Pi (Headless)"
     
     n_people, n_emb = recognizer.get_db_info()
+    
     print(f"📍 Mode: {mode}")
     print(f"👥 Database: {n_people} người ({n_emb} ảnh)")
-    print(f"⏱️ Cooldown: {COOLDOWN_SECONDS}s ({COOLDOWN_SECONDS//60}m)")
+    print(f"⏱️ Cooldown: {settings.COOLDOWN_SECONDS}s ({settings.COOLDOWN_SECONDS // 60}m)")
     
     if sync_result['added'] or sync_result['removed']:
         print(f"🔄 Sync: +{sync_result['added']} -{sync_result['removed']}")
     
-    # Hiển thị model type (INT8 hoặc Float32)
-    use_int8 = CONFIG.get('USE_INT8_MODELS', False)
-    print(f"🧠 Models: {'INT8 (optimized)' if use_int8 else 'Float32'}")
+    print(f"🧠 Models: INT8 (optimized)")
     
-    if LOW_MEMORY_MODE:
-        print(f"💾 Low-RAM: {CAMERA_WIDTH}x{CAMERA_HEIGHT}")
-    
-    if ENABLE_ADAPTIVE_SKIP:
-        print(f"⚡ Adaptive Skip: ON (target={int(TARGET_PROCESS_TIME*1000)}ms, range={MIN_FRAME_SKIP}-{MAX_FRAME_SKIP})")
+    if settings.ENABLE_ADAPTIVE_SKIP:
+        print(f"⚡ Adaptive Skip: ON (target={int(settings.TARGET_PROCESS_TIME * 1000)}ms)")
     else:
-        print(f"⚡ Frame Skip: {DEFAULT_FRAME_SKIP} (fixed)")
+        print(f"⚡ Frame Skip: {settings.DEFAULT_FRAME_SKIP} (fixed)")
     
-    if ENABLE_CENTER_ROI:
-        print(f"🎯 Center ROI: ON ({int(CENTER_ROI_RATIO*100)}% màn hình)")
+    if settings.ENABLE_CENTER_ROI:
+        print(f"🎯 Center ROI: ON ({int(settings.CENTER_ROI_RATIO * 100)}% màn hình)")
     
-    if ENABLE_MIDNIGHT_CHECKOUT:
+    if settings.ENABLE_MIDNIGHT_CHECKOUT:
         print(f"⏰ Auto Checkout: ON (00:00 mỗi ngày)")
-
-    # Log cơ bản từ config để xác nhận
-    logger.info(f"CONFIG: COOLDOWN={COOLDOWN_SECONDS}s, HOLD_TIME={HOLD_TIME_SECONDS}s, WEB={ENABLE_WEB_SERVER}:{WEB_PORT}, ANTISPOOF={ENABLE_ANTISPOOF}")
     
-    if ENABLE_WEB_SERVER:
+    if settings.ENABLE_WEB_SERVER:
         import socket
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -325,337 +285,322 @@ def main():
             s.close()
         except:
             local_ip = "localhost"
-        print(f"🌐 Web: http://{local_ip}:{WEB_PORT}")
+        print(f"🌐 Web: http://{local_ip}:{settings.WEB_PORT}")
     
-    print("-"*50)
-    if not HEADLESS_MODE:
+    print("-" * 50)
+    if not settings.HEADLESS_MODE:
         print("⌨️  r=đăng ký | d=xóa | l=list | q=thoát")
     else:
         print("⌨️  Ctrl+C để thoát")
-    print("="*50 + "\n")
+    print("=" * 50 + "\n")
 
-    frame_count = 0
-    captured_frame_count = 0
-    processed_frame_count = 0
-    fps_window_start = time.time()
-    last_status_time = 0
-    last_midnight_check = datetime.datetime.now().date()  # Ngày cuối cùng đã kiểm tra midnight
-    
-    # Khởi tạo Adaptive Frame Skip
-    adaptive_skip = AdaptiveFrameSkip() if ENABLE_ADAPTIVE_SKIP else None
 
-    def maybe_log_fps(now, faces_in_frame):
-        """
-        Ghi log FPS camera và pipeline mỗi ~10 giây để đánh giá hiệu suất thực tế.
-        """
-        nonlocal fps_window_start, captured_frame_count, processed_frame_count
-        elapsed = now - fps_window_start
-        if elapsed < 10:
-            return
-        if elapsed <= 0:
-            return
-        camera_fps = captured_frame_count / elapsed
-        pipeline_fps = processed_frame_count / elapsed
-        skip_value = adaptive_skip.current_skip if ENABLE_ADAPTIVE_SKIP and adaptive_skip else DEFAULT_FRAME_SKIP
-        # logger.info(
-        #     f"📹 FPS camera≈{camera_fps:.2f} | pipeline≈{pipeline_fps:.2f} | faces:{faces_in_frame} | skip:{skip_value}"
-        # )
-        fps_window_start = now
-        captured_frame_count = 0
-        processed_frame_count = 0
+def handle_keyboard(key: int, frame, detections, recognizer) -> bool:
+    """
+    Xử lý phím nhấn.
     
-    # Kiểm tra midnight checkout ngay khi khởi động (cho sessions từ hôm qua)
-    if ENABLE_MIDNIGHT_CHECKOUT:
+    Returns:
+        True nếu nên thoát chương trình
+    """
+    if key == ord('q'):
+        return True
+    
+    elif key == ord('l'):
+        # List registered faces
+        print("\n📋 Database:")
+        names = recognizer.get_registered_names()
+        if names:
+            for i, name in enumerate(names, 1):
+                emb_data = recognizer.db.get(name)
+                if isinstance(emb_data, list):
+                    count = len(emb_data)
+                elif hasattr(emb_data, "shape"):
+                    count = emb_data.shape[0]
+                else:
+                    count = 1
+                print(f"   {i}. {name} ({count})")
+        else:
+            print("   (trống)")
+        print()
+    
+    elif key == ord('d'):
+        # Delete face
+        cv2.destroyAllWindows()
+        print("\n🗑️ Xóa người:")
+        names = recognizer.get_registered_names()
+        if not names:
+            print("   Database trống!")
+        else:
+            for i, name in enumerate(names, 1):
+                print(f"   {i}. {name}")
+            choice = input("Nhập tên (Enter=hủy): ").strip()
+            if choice:
+                if recognizer.remove_face(choice):
+                    recognizer.save_db()
+                    remove_employee(choice)
+                    print(f"   ✅ Đã xóa: {choice}")
+                else:
+                    print(f"   ❌ Không tìm thấy: {choice}")
+        print()
+        cv2.namedWindow("May Cham Cong")
+    
+    elif key == ord('r'):
+        # Register new face
+        if len(detections) > 0:
+            detections.sort(key=lambda d: d['box'][2] * d['box'][3], reverse=True)
+            det = detections[0]
+            x, y, w, h = det['box']
+            face_reg = frame[y:y+h, x:x+w]
+            
+            cv2.destroyAllWindows()
+            name = input("Tên nhân viên: ").strip()
+            if name:
+                recognizer.add_face(name, face_reg)
+                recognizer.save_db()
+                add_employee(name)
+                print(f"   ✅ Đã đăng ký: {name}\n")
+            
+            cv2.namedWindow("May Cham Cong")
+    
+    return False
+
+
+def main():
+    """Main entry point."""
+    
+    # === 0. PARSE ARGUMENTS ===
+    args = parse_arguments()
+    arg_changes = apply_arguments(args)
+    
+    if arg_changes:
+        print("🔧 Command-line overrides:")
+        for change in arg_changes:
+            print(f"   • {change}")
+        print()
+    
+    # === 1. KHỞI TẠO DATABASE ===
+    init_db()
+    
+    # === 2. CAMERA ===
+    camera_config = CameraConfig(
+        width=settings.CAMERA_WIDTH,
+        height=settings.CAMERA_HEIGHT,
+        fps=15 if settings.IS_PI else 30
+    )
+    camera = CameraManager(device_id=args.camera, config=camera_config, is_pi=settings.IS_PI)
+    
+    if not camera.open():
+        print("❌ Không thể kết nối camera!")
+        return
+    
+    # === 3. MODELS ===
+    try:
+        # Face detector
+        detector = create_detector()
+        
+        # Face recognizer
+        recognizer = create_recognizer()
+        
+        # Sync database
+        sync_result = sync_employees_with_face_db(recognizer.get_registered_names())
+        
+        gc.collect()
+        
+    except Exception as e:
+        logger.error(f"Lỗi khởi tạo: {e}")
+        camera.release()
+        return
+    
+    # === 5. COMPONENTS ===
+    # Frame skip
+    frame_skip = create_frame_skip(
+        enabled=settings.ENABLE_ADAPTIVE_SKIP,
+        target_time=settings.TARGET_PROCESS_TIME,
+        min_skip=settings.MIN_FRAME_SKIP,
+        max_skip=settings.MAX_FRAME_SKIP,
+        default_skip=settings.DEFAULT_FRAME_SKIP
+    )
+    
+    # Display handler
+    display = DisplayHandler(overlay_enabled=settings.OVERLAY_ENABLED)
+    
+    # Attendance tracker
+    attendance = AttendanceTracker(
+        hold_time=settings.HOLD_TIME_SECONDS,
+        cooldown_seconds=settings.COOLDOWN_SECONDS
+    )
+    attendance.set_attendance_callback(log_attendance)
+    
+    # === 6. STARTUP INFO ===
+    print_startup_info(recognizer, sync_result)
+    logger.info(f"CONFIG: COOLDOWN={settings.COOLDOWN_SECONDS}s, "
+                f"HOLD={settings.HOLD_TIME_SECONDS}s, "
+                f"WEB={settings.ENABLE_WEB_SERVER}:{settings.WEB_PORT}")
+    
+    # === 7. WEB SERVER (background) - start sau khi có detector/recognizer ===
+    if settings.ENABLE_WEB_SERVER:
+        web_thread = threading.Thread(
+            target=start_web_server, 
+            args=(detector, recognizer),
+            daemon=True
+        )
+        web_thread.start()
+    
+    # === 8. MIDNIGHT CHECKOUT (on startup) ===
+    if settings.ENABLE_MIDNIGHT_CHECKOUT:
         auto_results = midnight_checkout_all_sessions()
-        if auto_results:
-            for r in auto_results:
-                logger.warning(f"⚠️ Midnight checkout: {r['name']} ({r['duration_str']})")
+        for r in auto_results:
+            logger.warning(f"⚠️ Midnight checkout: {r['name']} ({r['duration_str']})")
+    
+    # === 8. MAIN LOOP ===
+    frame_count = 0
+    last_midnight_check = datetime.datetime.now().date()
+    last_status_time = 0
+    last_db_reload_check = 0  # Hot-reload database check
+    DB_RELOAD_INTERVAL = 5.0  # Check mỗi 5 giây
     
     try:
         while True:
-            ret, frame = cap.read()
-            if not ret:
+            frame_count += 1
+            current_time = time.time()
+            
+            # --- Hot-reload database check (định kỳ mỗi 5s) ---
+            if current_time - last_db_reload_check >= DB_RELOAD_INTERVAL:
+                recognizer.reload_db_if_changed()
+                last_db_reload_check = current_time
+            
+            # --- Frame skip: dùng grab() để bỏ qua frame mà không decode ---
+            if not frame_skip.should_process(frame_count):
+                camera.grab()  # Chỉ advance buffer, không decode (nhanh hơn read)
+                continue
+            
+            # --- Đọc frame (chỉ khi cần xử lý) ---
+            frame = camera.read()
+            if frame is None:
                 logger.warning("Không đọc được camera!")
                 break
             
-            frame_count += 1
-            captured_frame_count += 1
-            current_time = time.time()
-            
-            # Kiểm tra midnight checkout khi sang ngày mới
-            if ENABLE_MIDNIGHT_CHECKOUT:
+            # --- Midnight checkout check (chỉ kiểm tra 1 lần/ngày) ---
+            if settings.ENABLE_MIDNIGHT_CHECKOUT:
                 today = datetime.datetime.now().date()
                 if today > last_midnight_check:
-                    auto_results = midnight_checkout_all_sessions()
-                    if auto_results:
-                        for r in auto_results:
-                            logger.warning(f"⚠️ Midnight checkout: {r['name']} ({r['duration_str']})")
+                    for r in midnight_checkout_all_sessions():
+                        logger.warning(f"⚠️ Midnight checkout: {r['name']} ({r['duration_str']})")
                     last_midnight_check = today
             
-            # Skip frames để tiết kiệm CPU/RAM
-            if ENABLE_ADAPTIVE_SKIP and adaptive_skip:
-                should_process = adaptive_skip.should_process(frame_count)
-            else:
-                should_process = (frame_count % DEFAULT_FRAME_SKIP == 0)
+            process_start = time.time()
             
-            if not should_process:
-                if not HEADLESS_MODE:
-                    cv2.imshow("May Cham Cong", frame)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        break
-                maybe_log_fps(current_time, 0)
-                continue
-            
-            # Bắt đầu đo thời gian xử lý
-            process_start_time = time.time()
-            
-            # Garbage collection định kỳ
-            if GC_INTERVAL and frame_count and frame_count % GC_INTERVAL == 0:
+            # --- GC ---
+            if settings.GC_INTERVAL and frame_count % settings.GC_INTERVAL == 0:
                 gc.collect()
-
-            # detection module nhận BGR (chuẩn OpenCV)
-            detections = detect_faces(frame)
-            processed_frame_count += 1
             
-            # Danh sách người được nhận diện trong frame này
+            # --- Detection ---
+            detections = detector.detect_faces(frame)
+            
+            # --- Center ROI ---
+            roi_bounds = None
+            if settings.ENABLE_CENTER_ROI:
+                roi_bounds = display.draw_center_roi(frame, settings.CENTER_ROI_RATIO)
+            
+            # --- Process faces ---
             recognized_this_frame = set()
-            processed_frame_count += 1
             
-            # Tính vùng Center ROI (chỉ tính 1 lần per frame)
-            frame_h, frame_w = frame.shape[:2]
-            if ENABLE_CENTER_ROI:
-                roi_margin = (1 - CENTER_ROI_RATIO) / 2
-                roi_x_min = int(frame_w * roi_margin)
-                roi_x_max = int(frame_w * (1 - roi_margin))
-                roi_y_min = int(frame_h * roi_margin)
-                roi_y_max = int(frame_h * (1 - roi_margin))
-                
-                # Vẽ khung ROI để hướng dẫn người dùng (chỉ khi có GUI)
-                if OVERLAY_ENABLED:
-                    cv2.rectangle(frame, (roi_x_min, roi_y_min), (roi_x_max, roi_y_max), 
-                                  (200, 200, 200), 1)
-
             for det in detections:
                 x, y, w, h = det['box']
                 
-                # Validate kích thước: Mặt quá nhỏ (<60px) thì bỏ qua để đỡ tốn CPU detect anti-spoof
+                # Skip too small faces
                 if w < 60 or h < 60:
                     continue
                 
-                # --- CENTER ROI CHECK ---
-                # Kiểm tra xem tâm khuôn mặt có nằm trong vùng trung tâm không
-                face_center_x = x + w // 2
-                face_center_y = y + h // 2
-                
-                if ENABLE_CENTER_ROI:
-                    is_in_center = (roi_x_min <= face_center_x <= roi_x_max and 
-                                    roi_y_min <= face_center_y <= roi_y_max)
-                else:
-                    is_in_center = True  # Không giới hạn nếu tắt Center ROI
-
                 face = frame[y:y+h, x:x+w]
-                if face.size == 0: continue
+                if face.size == 0:
+                    continue
                 
-                # Nếu mặt nằm ngoài vùng trung tâm, chỉ hiển thị hướng dẫn, không nhận diện
-                if not is_in_center:
-                    if OVERLAY_ENABLED:
-                        cv2.rectangle(frame, (x, y), (x+w, y+h), (128, 128, 128), 1)  # Màu xám
-                        cv2.putText(frame, "Di chuyen vao giua", (x, y-10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (128, 128, 128), 1)
-                    continue  # Bỏ qua, không chạy recognition
-
-                # --- BƯỚC 1: Anti-Spoofing (có thể tắt để test) ---
-                if ENABLE_ANTISPOOF and anti is not None:
-                    is_real = anti.is_live(face)
+                # Center ROI check
+                if roi_bounds and not display.is_in_roi((x, y, w, h), roi_bounds):
+                    display.draw_face(frame, (x, y, w, h), FaceStatus.OUTSIDE_ROI)
+                    continue
+                
+                # Recognition
+                label, distance = recognizer.recognize(
+                    face, 
+                    threshold=settings.RECOGNITION_THRESHOLD
+                )
+                
+                if label is None:
+                    display.draw_face(
+                        frame, (x, y, w, h), 
+                        FaceStatus.UNKNOWN, 
+                        distance=distance
+                    )
+                    
                 else:
-                    is_real = True  # Bỏ qua anti-spoof
-                
-                # --- BƯỚC 2: Recognition ---
-                label, distance = recognizer.recognize(face, threshold=RECOGNITION_THRESHOLD)
-                
-                # Hiển thị distance để debug (chỉ khi có GUI)
-                dist_text = ""
-                if OVERLAY_ENABLED and distance < float('inf'):
-                    dist_text = f"d={distance:.2f}"
-                
-                if not is_real:
-                    # FAKE: Màu đỏ
-                    if OVERLAY_ENABLED:
-                        cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 0, 255), 2)
-                        name_text = label if label else "Unknown"
-                        cv2.putText(frame, f"FAKE - {name_text}", (x, y-10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                else:
-                    # REAL: Xử lý theo có nhận diện được hay không
-                    if label is None:
-                        # Người lạ (Vàng) - chưa đăng ký hoặc distance quá xa
-                        if OVERLAY_ENABLED:
-                            cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 255), 2)
-                            cv2.putText(frame, f"Unknown {dist_text}", (x, y-10),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                    # Recognized -> process attendance
+                    recognized_this_frame.add(label)
+                    
+                    result = attendance.process_face(label, current_time)
+                    
+                    if result.is_holding:
+                        display.draw_hold_progress(
+                            frame, (x, y, w, h),
+                            result.hold_progress,
+                            result.hold_remaining,
+                            label
+                        )
                     else:
-                        # Người quen (Xanh lá) - đã đăng ký
-                        recognized_this_frame.add(label)
-                        current_time = time.time()
+                        display.draw_face(
+                            frame, (x, y, w, h),
+                            FaceStatus.RECOGNIZED,
+                            name=label,
+                            distance=distance
+                        )
+                    
+                    if result.should_log:
+                        symbol = "🟢" if result.action == AttendanceAction.CHECK_IN else "🔴"
+                        logger.info(f"{symbol} {label} - {result.action.value.upper().replace('_', '-')}")
                         
-                        # --- BƯỚC 3: Logic giữ mặt ---
-                        # Nếu chưa theo dõi người này, bắt đầu theo dõi
-                        if label not in face_hold_tracker:
-                            face_hold_tracker[label] = current_time
-                        
-                        # Tính thời gian đã giữ mặt
-                        hold_duration = current_time - face_hold_tracker[label]
-                        remaining = max(0, HOLD_TIME_SECONDS - hold_duration)
-                        
-                        # Hiển thị progress bar giữ mặt
-                        progress = min(hold_duration / HOLD_TIME_SECONDS, 1.0)
-                        bar_width = w
-                        bar_height = 8
-                        bar_y = y + h + 5
-                        
-                        # Vẽ khung và progress (chỉ khi có GUI)
-                        if OVERLAY_ENABLED:
-                            cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
-                            cv2.rectangle(frame, (x, bar_y), (x + bar_width, bar_y + bar_height), (100, 100, 100), -1)
-                            cv2.rectangle(frame, (x, bar_y), (x + int(bar_width * progress), bar_y + bar_height), (0, 255, 0), -1)
-                        
-                        if remaining > 0:
-                            # Đang đếm ngược
-                            if OVERLAY_ENABLED:
-                                cv2.putText(frame, f"{label} - Giu {remaining:.1f}s", (x, y-10),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                        else:
-                            # Đủ thời gian giữ mặt -> Chấm công
-                            if OVERLAY_ENABLED:
-                                cv2.putText(frame, f"{label} {dist_text}", (x, y-10),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                            
-                            # --- BƯỚC 4: Logic Chấm Công (Debounce) ---
-                            if label not in last_checkin or (current_time - last_checkin[label] > COOLDOWN_SECONDS):
-                                action = log_attendance(label)  # Returns 'check_in' or 'check_out'
-                                last_checkin[label] = current_time
-                                # Xóa khỏi tracker để tránh chấm công lại ngay
-                                # (sẽ được thêm lại nếu người đó vẫn trong frame sau cooldown)
-                                if label in face_hold_tracker:
-                                    del face_hold_tracker[label]
-                                
-                                # Log ngắn gọn
-                                symbol = "🟢" if action == 'check_in' else "🔴"
-                                logger.info(f"{symbol} {label} - {action.upper().replace('_', '-')}")
-                                
-                                if not HEADLESS_MODE:
-                                    if action == 'check_in':
-                                        cv2.putText(frame, "CHECK-IN OK", (10, 50), 
-                                                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
-                                    else:
-                                        cv2.putText(frame, "CHECK-OUT OK", (10, 50), 
-                                                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 165, 255), 3)
+                        if not settings.HEADLESS_MODE:
+                            display.draw_check_status(frame, result.action.value)
             
-            # Xóa tracker của những người không còn trong frame
-            faces_to_remove = [name for name in face_hold_tracker if name not in recognized_this_frame]
-            for name in faces_to_remove:
-                # Chỉ xóa nếu không trong cooldown
-                if name not in last_checkin or (time.time() - last_checkin.get(name, 0) > COOLDOWN_SECONDS):
-                    del face_hold_tracker[name]
-
-            # --- CẬP NHẬT ADAPTIVE FRAME SKIP ---
-            if ENABLE_ADAPTIVE_SKIP and adaptive_skip:
-                process_time = time.time() - process_start_time
-                adaptive_skip.update(process_time)
-
-            # --- PHẦN HIỂN THỊ VÀ ĐIỀU KHIỂN ---
-            if HEADLESS_MODE:
-                # HEADLESS MODE (Pi): Log định kỳ mỗi 5 phút
-                current_time = time.time()
-                if current_time - last_status_time > 300:  # 5 phút
-                    # Thêm thông tin adaptive skip vào log
-                    if ENABLE_ADAPTIVE_SKIP and adaptive_skip:
-                        stats = adaptive_skip.get_stats()
-                        logger.info(f"♻️ Running... Faces: {len(detections)}, Skip: {stats['current_skip']}, Avg: {stats['avg_process_ms']:.0f}ms")
-                    else:
-                        logger.info(f"♻️ Running... Faces detected: {len(detections)}")
+            # Cleanup trackers
+            attendance.cleanup_frame(recognized_this_frame)
+            
+            # Update frame skip
+            process_time = time.time() - process_start
+            frame_skip.update(process_time)
+            
+            # --- DISPLAY ---
+            if settings.HEADLESS_MODE:
+                # Headless: periodic status log
+                if current_time - last_status_time > 300:
+                    stats = frame_skip.get_stats()
+                    logger.info(f"♻️ Running... Faces: {len(detections)}, "
+                               f"Skip: {stats.current_skip}, Avg: {stats.avg_process_ms:.0f}ms")
                     last_status_time = current_time
-
-                # Log FPS định kỳ để đo hiệu suất camera/pipeline
             else:
-                # GUI MODE (Windows): Hiển thị cửa sổ camera và xử lý phím
-                
-                # Hiển thị thông tin Adaptive Skip trên GUI
-                if ENABLE_ADAPTIVE_SKIP and adaptive_skip:
-                    stats = adaptive_skip.get_stats()
-                    info_text = f"Skip:{stats['current_skip']} | {stats['avg_process_ms']:.0f}ms | ~{stats['effective_fps']:.1f}fps"
-                    cv2.putText(frame, info_text, (10, frame.shape[0] - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+                # GUI mode
+                stats = frame_skip.get_stats()
+                display.draw_stats(frame, {
+                    'current_skip': stats.current_skip,
+                    'avg_process_ms': stats.avg_process_ms,
+                    'effective_fps': stats.effective_fps
+                })
                 
                 cv2.imshow("May Cham Cong", frame)
                 
                 key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
+                if handle_keyboard(key, frame, detections, recognizer):
                     break
-                elif key == ord('l'):
-                    # Hiển thị danh sách đã đăng ký
-                    print("\n📋 Database:")
-                    names = recognizer.get_registered_names()
-                    if names:
-                        for i, name in enumerate(names, 1):
-                            emb_data = recognizer.db.get(name)
-                            if isinstance(emb_data, list):
-                                emb_count = len(emb_data)
-                            elif hasattr(emb_data, "shape"):
-                                emb_count = emb_data.shape[0]
-                            else:
-                                emb_count = 1
-                            print(f"   {i}. {name} ({emb_count})")
-                    else:
-                        print("   (trống)")
-                    print()
-                elif key == ord('d'):
-                    # Xóa người khỏi database
-                    cv2.destroyAllWindows()
-                    print("\n🗑️ Xóa người:")
-                    names = recognizer.get_registered_names()
-                    if not names:
-                        print("   Database trống!")
-                    else:
-                        for i, name in enumerate(names, 1):
-                            print(f"   {i}. {name}")
-                        choice = input("Nhập tên (Enter=hủy): ").strip()
-                        if choice:
-                            if recognizer.remove_face(choice):
-                                recognizer.save_db()
-                                remove_employee(choice)
-                                print(f"   ✅ Đã xóa: {choice}")
-                            else:
-                                print(f"   ❌ Không tìm thấy: {choice}")
-                    print()
-                    cv2.namedWindow("May Cham Cong")
-                elif key == ord('r'):
-                    # Đăng ký khuôn mặt mới
-                    if len(detections) > 0:
-                        detections.sort(key=lambda d: d['box'][2] * d['box'][3], reverse=True)
-                        det = detections[0]
-                        x, y, w, h = det['box']
-                        face_reg = frame[y:y+h, x:x+w]
-                        
-                        cv2.destroyAllWindows()
-                        name = input("Tên nhân viên: ").strip()
-                        if name:
-                            recognizer.add_face(name, face_reg)
-                            recognizer.save_db()
-                            add_employee(name)
-                            print(f"   ✅ Đã đăng ký: {name}\n")
-                        
-                        cv2.namedWindow("May Cham Cong")
-                    
-            maybe_log_fps(time.time(), len(detections))
-            
+    
     except KeyboardInterrupt:
         print("\n🛑 Đã dừng (Ctrl+C)")
+    
     finally:
-        cap.release()
-        if not HEADLESS_MODE:
+        camera.release()
+        if not settings.HEADLESS_MODE:
             cv2.destroyAllWindows()
         print("👋 Bye!")
+
 
 if __name__ == "__main__":
     main()

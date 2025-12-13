@@ -1,2 +1,4 @@
 dataset/
 *.csv
+__pycache__/
+*.npy

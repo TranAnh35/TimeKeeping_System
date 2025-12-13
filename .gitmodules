@@ -7,3 +7,6 @@
 [submodule "Ultra-Light-Fast-Generic-Face-Detector-1MB"]
 	path = Ultra-Light-Fast-Generic-Face-Detector-1MB
 	url = https://github.com/Linzaer/Ultra-Light-Fast-Generic-Face-Detector-1MB.git
+[submodule "MobileFaceNet_TF"]
+	path = MobileFaceNet_TF
+	url = https://github.com/sirius-ai/MobileFaceNet_TF.git

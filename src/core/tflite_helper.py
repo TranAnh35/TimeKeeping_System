@@ -1,4 +1,4 @@
-# src/tflite_helper.py
+# src/core/tflite_helper.py
 """
 Helper module để load TFLite interpreter.
 Tự động chọn giữa tensorflow.lite và tflite_runtime.
@@ -11,19 +11,19 @@ import platform
 IS_PI = platform.system() == "Linux" and os.path.exists("/proc/device-tree/model")
 
 try:
-    from .config import CONFIG as _CONFIG
+    from .settings import settings
 except ImportError:
     try:
-        from config import CONFIG as _CONFIG
+        from core.settings import settings
     except ImportError:
-        _CONFIG = None
+        settings = None
 
 def _resolve_thread_count():
     default_threads = 2 if IS_PI else 4
-    if _CONFIG is None:
+    if settings is None:
         return default_threads
 
-    configured = _CONFIG.get('TFLITE_NUM_THREADS')
+    configured = settings.tflite_num_threads
     if configured is None:
         return default_threads
 

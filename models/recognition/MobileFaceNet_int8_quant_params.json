@@ -1,0 +1,29 @@
+{
+  "model_path": "MobileFaceNet.tflite",
+  "quantization_type": "runtime_int8",
+  "input": {
+    "shape": [
+      2,
+      112,
+      112,
+      3
+    ],
+    "scale": 0.007874015718698502,
+    "zero_point": 0,
+    "dtype": "int8",
+    "original_dtype": "float32"
+  },
+  "outputs": [
+    {
+      "index": 0,
+      "shape": [
+        2,
+        192
+      ],
+      "scale": 0.07505225390195847,
+      "zero_point": 0,
+      "dtype": "int8",
+      "original_dtype": "float32"
+    }
+  ]
+}

@@ -2,6 +2,10 @@
 """
 Web server đơn giản để xem chấm công từ xa qua WiFi.
 Truy cập: http://<IP_Pi>:5000
+
+Các trang:
+- /         : Dashboard chấm công
+- /manage   : Quản lý đăng ký/xóa thành viên
 """
 import os
 import sys
@@ -10,7 +14,7 @@ from datetime import datetime
 
 # Support both direct script execution and module import
 try:
-    from .database import (
+    from ..data.database import (
         get_today_attendance, 
         get_attendance_by_date,
         get_summary_by_person,
@@ -20,8 +24,9 @@ try:
         export_to_csv,
         get_anomaly_sessions
     )
+    from .management import management_bp, init_management
 except ImportError:
-    from database import (
+    from data.database import (
         get_today_attendance, 
         get_attendance_by_date,
         get_summary_by_person,
@@ -31,8 +36,12 @@ except ImportError:
         export_to_csv,
         get_anomaly_sessions
     )
+    from management import management_bp, init_management
 
 app = Flask(__name__)
+
+# Register management blueprint
+app.register_blueprint(management_bp)
 
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
@@ -329,6 +338,19 @@ def run_server(host='0.0.0.0', port=5000):
     log.setLevel(logging.ERROR)
     
     app.run(host=host, port=port, debug=False, threaded=True, use_reloader=False)
+
+
+def setup_management(detector, recognizer):
+    """
+    Setup management module với detector và recognizer.
+    Gọi từ main.py sau khi đã khởi tạo models.
+    
+    Args:
+        detector: Face detector instance
+        recognizer: Face recognizer instance
+    """
+    init_management(detector, recognizer)
+
 
 if __name__ == "__main__":
     run_server()
